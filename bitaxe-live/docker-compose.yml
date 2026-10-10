@@ -8,7 +8,7 @@ services:
       - umbrel_main_network
 
   app:
-    image: bitaxe-live:1.0.0
+    image: ghcr.io/maxterror/bitaxe-live:1.0.0
     restart: unless-stopped
     environment:
       PYTHONUNBUFFERED: "1"

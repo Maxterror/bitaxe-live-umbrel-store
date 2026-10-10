@@ -9,9 +9,10 @@ description: >-
   Live-Telemetrie, individuellen Designs, Discord-Integration
   und Miner-Steuerung.
 developer: Bitaxe Live
-website: https://github.com/getumbrel/umbrel
+website: https://github.com/Maxterror/bitaxe-live-umbrel-store
 dependencies: []
-port: 8086
+port: 8087
+icon: "https://raw.githubusercontent.com/Maxterror/bitaxe-live-umbrel-store/main/bitaxe-live/icon.png"
 path: ""
 defaultUsername: ""
 defaultPassword: ""
