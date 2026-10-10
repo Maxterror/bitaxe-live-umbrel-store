@@ -1,0 +1,17 @@
+manifestVersion: 1
+id: bitaxe-live
+category: bitcoin
+name: Bitaxe Live
+version: "1.0.0"
+tagline: Live-Monitoring für Bitaxe und HarloOS
+description: >-
+  Bitaxe Live bietet ein Dashboard für Bitaxe-Miner mit
+  Live-Telemetrie, individuellen Designs, Discord-Integration
+  und Miner-Steuerung.
+developer: Bitaxe Live
+website: https://github.com/getumbrel/umbrel
+dependencies: []
+port: 8086
+path: ""
+defaultUsername: ""
+defaultPassword: ""

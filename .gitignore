@@ -1,0 +1,6 @@
+data/
+*backup*/
+.env
+.env.*
+settings.json
+*.zip

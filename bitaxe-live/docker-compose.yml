@@ -1,0 +1,25 @@
+services:
+  app_proxy:
+    environment:
+      APP_HOST: bitaxe-live-app
+      APP_PORT: 8085
+      JWT_SECRET: "${JWT_SECRET}"
+    networks:
+      - umbrel_main_network
+
+  app:
+    image: bitaxe-live:1.0.0
+    restart: unless-stopped
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DASHBOARD_PASSWORD: "${APP_PASSWORD}"
+    volumes:
+      - ${APP_DATA_DIR}/data:/app/data
+    networks:
+      umbrel_main_network:
+        aliases:
+          - bitaxe-live-app
+
+networks:
+  umbrel_main_network:
+    external: true
