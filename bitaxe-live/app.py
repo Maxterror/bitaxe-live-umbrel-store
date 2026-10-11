@@ -7,17 +7,77 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT=Path('/app/data'); ROOT.mkdir(parents=True,exist_ok=True)
 FILE=ROOT/'settings.json'
-DEFAULT={'miners':[],'discord_token':'','discord_channel_id':'','discord_guild_id':'','admin_role_ids':'','title':'BITAXE LIVE','refresh_seconds':10,'theme':{'bg':'#0b1116','panel':'#17242a','text':'#ecf8f7','accent':'#46e0c2'},'fields':['hashrate_ghs','asic_temp_c','vr_temp_c','device_power_w','fans','accepted_shares','rejected_shares','best_share_all_time','uptime_seconds'],'selected':0,'block_alert':None,'block_baselines':{},'logo':False,'dashboard_message_id':'','font_family':'dejavu','font_title_size':43,'font_value_size':38,'font_label_size':22,'language':'de','setup_complete':True,'bot_enabled':False}
+HISTORY_FILE=ROOT/'history.json'
+GRAPH_FIELDS=('hashrate_ghs','device_power_w','asic_temp_c','vr_temp_c','fans','free_ram')
+DEFAULT={'miners':[],'discord_token':'','discord_channel_id':'','discord_guild_id':'','admin_role_ids':'','title':'BITAXE LIVE','refresh_seconds':10,'temp_limits':{'asic_yellow':60,'asic_red':70,'vr_yellow':65,'vr_red':80},'theme':{'bg':'#0b1116','panel':'#17242a','text':'#ecf8f7','accent':'#46e0c2'},'fields':['hashrate_ghs','asic_temp_c','vr_temp_c','device_power_w','fans','accepted_shares','rejected_shares','best_share_all_time','uptime_seconds'],'selected':0,'block_alert':None,'block_baselines':{},'logo':False,'dashboard_message_id':'','font_family':'dejavu','font_title_size':43,'font_value_size':38,'font_label_size':22,'language':'de','setup_complete':True,'bot_enabled':False}
 LOCK=threading.RLock(); app=Flask(__name__); app.secret_key=os.environ.get('APP_SECRET',os.urandom(32).hex())
 logging.basicConfig(level=logging.INFO)
 
 def config():
     with LOCK:
-        try: d=json.loads(FILE.read_text()); return {**DEFAULT,**d,'theme':{**DEFAULT['theme'],**d.get('theme',{})}}
+        try: d=json.loads(FILE.read_text()); return {**DEFAULT,**d,'theme':{**DEFAULT['theme'],**d.get('theme',{})},'temp_limits':{**DEFAULT['temp_limits'],**d.get('temp_limits',{})}}
         except (FileNotFoundError,ValueError): return dict(DEFAULT)
 def save(d):
     with LOCK:
         p=FILE.with_suffix('.tmp'); p.write_text(json.dumps(d,indent=2)); p.replace(FILE)
+
+HISTORY_LOCK = threading.RLock()
+
+def graph_number(value):
+    try:
+        if isinstance(value, bool):
+            return None
+        number = float(value)
+        return number if -1e15 < number < 1e15 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+def record_history(miners):
+    now = int(time.time())
+    cutoff = now - 86400
+    with HISTORY_LOCK:
+        try:
+            history = json.loads(HISTORY_FILE.read_text())
+            if not isinstance(history, dict):
+                history = {}
+        except (OSError, ValueError):
+            history = {}
+
+        changed = False
+
+        for miner in miners:
+            raw = miner.get('raw')
+            if not isinstance(raw, dict):
+                continue
+            values = {}
+            for key in GRAPH_FIELDS:
+                if key == 'fans':
+                    fans = raw.get('fans') or []
+                    value = fans[0].get('percent') if isinstance(fans, list) and fans and isinstance(fans[0], dict) else None
+                else:
+                    value = raw.get(key)
+                values[key] = graph_number(value)
+
+            ip = miner['ip']
+            points = history.get(ip, [])
+            if not isinstance(points, list):
+                points = []
+            points = [point for point in points if isinstance(point, dict) and point.get('time', 0) >= cutoff]
+            old_points = history.get(ip, [])
+            if not points or now - points[-1].get('time', 0) >= 10:
+                points.append({'time': now, 'values': values})
+            points = points[-8640:]
+            if points != old_points:
+                history[ip] = points
+                changed = True
+
+        if not changed:
+            return
+
+        tmp = HISTORY_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(history, separators=(',', ':')))
+        tmp.replace(HISTORY_FILE)
+
 def miner_ip(s):
     ip=ipaddress.ip_address(s)
     if not ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast: raise ValueError('Nur private LAN-IP-Adressen erlaubt')
@@ -44,11 +104,41 @@ def login():
     return '<form method="post"><h2>Bitaxe Live Login</h2><input type="password" name="password" required><button>Login</button></form>'
 
 FIELDS={'hashrate_ghs':'Hashrate','asic_temp_c':'ASIC Temperatur','vr_temp_c':'VR Temperatur','device_power_w':'Leistung (geschätzt)','fans':'Lüfter','accepted_shares':'Accepted','rejected_shares':'Rejected','best_share_all_time':'Best Share','uptime_seconds':'Uptime','pool_latency_ms':'Pool-Latenz','core_voltage_mv':'Core mV','input_voltage_v':'Input V','active_pll_mhz':'Frequenz MHz','firmware_version':'Firmware'}
+def value_color(key, value, limits):
+    colors = {
+        'hashrate_ghs': '#86efac',
+        'device_power_w': '#e7b66e',
+        'best_share_all_time': '#e7b66e',
+        'accepted_shares': '#86efac',
+        'rejected_shares': '#fb7185',
+    }
+    if key in ('asic_temp_c', 'vr_temp_c'):
+        try:
+            temp = float(value)
+            prefix = 'asic' if key == 'asic_temp_c' else 'vr'
+            if temp >= limits[prefix + '_red']:
+                return '#fb7185'
+            if temp >= limits[prefix + '_yellow']:
+                return '#facc15'
+            return '#86efac'
+        except (TypeError, ValueError, KeyError):
+            return '#a1b5b7'
+    return colors.get(key, '#ecf8f7')
+
 def formatted(k,t):
     v=t.get(k)
     if k=='fans':
         fans=v or []; return str(fans[0].get('percent','?'))+' %' if fans else '–'
     if v is None: return '–'
+    if k=='best_share_all_time':
+        try:
+            n = float(v)
+            for factor, suffix in ((1e12, 'T'), (1e9, 'G'), (1e6, 'M'), (1e3, 'K')):
+                if abs(n) >= factor:
+                    return f'{n/factor:.2f} {suffix}'.replace('.', ',')
+            return str(int(n)) if n.is_integer() else str(n).replace('.', ',')
+        except (ValueError, TypeError):
+            return str(v)
     if k=='hashrate_ghs': return f'{float(v)/1000:.2f} TH/s'
     if k in ('asic_temp_c','vr_temp_c'): return f'{float(v):.1f} °C'
     if k=='device_power_w': return f'{float(v):.1f} W*'
@@ -58,7 +148,7 @@ def formatted(k,t):
 def scan():
     d=config(); result=[]; changed=False
     for m in d['miners']:
-        t=telemetry(m['ip']); result.append({'name':m['name'],'ip':m['ip'],'online':bool(t),'values':{k:formatted(k,t) for k in d['fields']} if t else {},'raw':t})
+        t=telemetry(m['ip']); result.append({'name':m['name'],'ip':m['ip'],'online':bool(t),'values':{k:formatted(k,t) for k in d['fields']} if t else {},'raw':t,'colors':{k:value_color(k,t.get(k),d['temp_limits']) for k in d['fields']} if t else {}})
         if t:
             key=m['ip']; count=sum(int(p.get('blocks_mined') or 0) for p in t.get('pools',[]))
             previous=d['block_baselines'].get(key)
@@ -79,10 +169,220 @@ PAGE='''<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="v
 <div style="display:flex;justify-content:space-between;align-items:center;gap:12px"><h1>BITAXE LIVE DASHBOARD</h1><a href="/settings" style="color:#46e0c2;font-size:19px">⚙ {{'Einstellungen' if cfg.language=='de' else 'Settings'}}</a></div><p class="muted">HarloOS Miner-Schwarm · Umbrel Beta</p>
 {% if cfg.block_alert %}<section class="alert"><h1>🏆 BLOCK FOUND! {{cfg.block_alert.name}}</h1><p>Bleibt bis zum manuellen Reset sichtbar.</p><form method="post" action="/reset-block"><button class="danger">Blockmeldung zurücksetzen</button></form></section>{% endif %}
 <section><h2>{{'Live-Miner' if cfg.language=='de' else 'Live miners'}}</h2><div id="live">Lade Live-Daten…</div></section>
+<section id="graph-section">
+<h2>📈 TERROR LIVE GRAPH</h2>
+<div class="graph-controls">
+<button type="button" data-minutes="5">5 Min.</button>
+<button type="button" data-minutes="15">15 Min.</button>
+<button type="button" data-minutes="60">1 Std.</button>
+<button type="button" data-minutes="1440">24 Std.</button>
+</div>
+<div id="graph-legend" style="display:flex;flex-wrap:wrap;gap:12px;margin:14px 0">
+<label><input type="checkbox" data-graph-metric="hashrate_ghs" checked> <span style="color:#86efac">● Hashrate</span></label>
+<label><input type="checkbox" data-graph-metric="device_power_w" checked> <span style="color:#e7b66e">● Watt</span></label>
+<label><input type="checkbox" data-graph-metric="asic_temp_c" checked> <span style="color:#38bdf8">● ASIC</span></label>
+<label><input type="checkbox" data-graph-metric="vr_temp_c" checked> <span style="color:#facc15">● VR</span></label>
+<label><input type="checkbox" data-graph-metric="fans" checked> <span style="color:#c084fc">● Lüfter</span></label>
+<label><input type="checkbox" data-graph-metric="free_ram"> <span style="color:#fb7185">● RAM</span></label>
+</div>
+<p class="muted" id="graph-status">Warte auf Messwerte…</p>
+<canvas id="live-graph" width="960" height="360" style="width:100%;max-width:100%;background:#0b1116;border-radius:12px"></canvas>
+</section>
 <section><h2>{{'Miner verwalten' if cfg.language=='de' else 'Manage miners'}}</h2>{% for m in cfg.miners %}<form method="post" action="/remove/{{loop.index0}}"><b>{{m.name}}</b> <span class="muted">{{m.ip}}</span><button class="danger">{{'Entfernen' if cfg.language=='de' else 'Remove'}}</button></form>{% endfor %}<form method="post" action="/add"><input name="name" placeholder="Miner-Name" maxlength="50" required><input name="ip" placeholder="192.168.178.24" required><button>{{'Miner hinzufügen' if cfg.language=='de' else 'Add miner'}}</button></form></section>
-<section><h2>{{'Dashboard-Design' if cfg.language=='de' else 'Dashboard design'}}</h2><form method="post" action="/design"><input name="title" value="{{cfg.title}}" maxlength="70" placeholder="Titel"><label>Hintergrund <input type="color" name="bg" value="{{cfg.theme.bg}}"></label><label>Karten <input type="color" name="panel" value="{{cfg.theme.panel}}"></label><label>Schrift <input type="color" name="text" value="{{cfg.theme.text}}"></label><label>Akzent <input type="color" name="accent" value="{{cfg.theme.accent}}"></label><div style="width:100%"><b>Werte anzeigen:</b><br>{% for key,label in fields.items() %}<label><input type="checkbox" name="fields" value="{{key}}" {% if key in cfg.fields %}checked{% endif %}>{{label}}</label>{% endfor %}</div><div style="width:100%;display:flex;flex-wrap:wrap;gap:12px;align-items:center"><label>Schriftart <select name="font_family">{% for key,name in font_options.items() %}<option value="{{key}}" {% if cfg.font_family==key %}selected{% endif %}>{{name}}</option>{% endfor %}</select></label><label>Titelgröße <input type="range" name="font_title_size" min="24" max="66" value="{{cfg.font_title_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_title_size}}</output></label><label>Messwertgröße <input type="range" name="font_value_size" min="20" max="58" value="{{cfg.font_value_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_value_size}}</output></label><label>Beschriftungsgröße <input type="range" name="font_label_size" min="14" max="32" value="{{cfg.font_label_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_label_size}}</output></label></div><label>Intervall (Sekunden) <input type="number" name="refresh" min="5" max="300" value="{{cfg.refresh_seconds}}"></label><button>{{'Design speichern' if cfg.language=='de' else 'Save design'}}</button></form><form action="/logo" method="post" enctype="multipart/form-data"><label>Eigenes Logo (PNG/JPG, 128×128 empfohlen) <input type="file" name="logo" accept="image/png,image/jpeg" required></label><button>{{'Logo hochladen' if cfg.language=='de' else 'Upload logo'}}</button></form><p><img class="preview" src="/preview.png?t={{stamp}}" alt="Dashboard Vorschau"></p></section>
+<section><h2>{{'Dashboard-Design' if cfg.language=='de' else 'Dashboard design'}}</h2><form method="post" action="/design"><input name="title" value="{{cfg.title}}" maxlength="70" placeholder="Titel"><label>Hintergrund <input type="color" name="bg" value="{{cfg.theme.bg}}"></label><label>Karten <input type="color" name="panel" value="{{cfg.theme.panel}}"></label><label>Schrift <input type="color" name="text" value="{{cfg.theme.text}}"></label><label>Akzent <input type="color" name="accent" value="{{cfg.theme.accent}}"></label><div style="width:100%"><b>Werte anzeigen:</b><br>{% for key,label in fields.items() %}<label><input type="checkbox" name="fields" value="{{key}}" {% if key in cfg.fields %}checked{% endif %}>{{label}}</label>{% endfor %}</div><div style="width:100%;display:flex;flex-wrap:wrap;gap:12px;align-items:center"><label>Schriftart <select name="font_family">{% for key,name in font_options.items() %}<option value="{{key}}" {% if cfg.font_family==key %}selected{% endif %}>{{name}}</option>{% endfor %}</select></label><label>Titelgröße <input type="range" name="font_title_size" min="24" max="66" value="{{cfg.font_title_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_title_size}}</output></label><label>Messwertgröße <input type="range" name="font_value_size" min="20" max="58" value="{{cfg.font_value_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_value_size}}</output></label><label>Beschriftungsgröße <input type="range" name="font_label_size" min="14" max="32" value="{{cfg.font_label_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_label_size}}</output></label></div><div style="width:100%">
+<b>🌡️ Temperatur-Farben (°C)</b>
+<p class="muted">Grün unter Gelb, Gelb bis Rot, Rot ab der roten Grenze.</p>
+<label>ASIC Gelb ab <input type="number" name="asic_yellow" min="0" max="120" value="{{cfg.temp_limits.asic_yellow}}"></label>
+<label>ASIC Rot ab <input type="number" name="asic_red" min="0" max="120" value="{{cfg.temp_limits.asic_red}}"></label>
+<label>VR Gelb ab <input type="number" name="vr_yellow" min="0" max="120" value="{{cfg.temp_limits.vr_yellow}}"></label>
+<label>VR Rot ab <input type="number" name="vr_red" min="0" max="120" value="{{cfg.temp_limits.vr_red}}"></label>
+</div><label>Intervall (Sekunden) <input type="number" name="refresh" min="2" max="300" value="{{cfg.refresh_seconds}}"></label><button>{{'Design speichern' if cfg.language=='de' else 'Save design'}}</button></form><form action="/logo" method="post" enctype="multipart/form-data"><label>Eigenes Logo (PNG/JPG, 128×128 empfohlen) <input type="file" name="logo" accept="image/png,image/jpeg" required></label><button>{{'Logo hochladen' if cfg.language=='de' else 'Upload logo'}}</button></form><p><img class="preview" src="/preview.png?t={{stamp}}" alt="Dashboard Vorschau"></p></section>
 <section><h2>Discord-Bot</h2><p><b>{{'Status' if cfg.language=='de' else 'Status'}}:</b> {{'🟢 Aktiviert' if cfg.bot_enabled else '⚪ Gestoppt'}}</p><form method="post" action="/bot-toggle"><button>{{'Bot stoppen' if cfg.bot_enabled else 'Bot starten'}}</button></form><p class="muted">Bot im Discord Developer Portal anlegen, Token hier hinterlegen und Bot mit bot + applications.commands Berechtigungen einladen. Token niemals öffentlich teilen.</p><form method="post" action="/discord"><input type="password" name="token" placeholder="Neuer Bot-Token (leer = behalten)"><input name="channel" value="{{cfg.discord_channel_id}}" placeholder="Discord Channel ID"><input name="guild" value="{{cfg.discord_guild_id}}" placeholder="Server/Guild ID"><input name="roles" value="{{cfg.admin_role_ids}}" placeholder="Admin-Rollen-IDs, kommagetrennt"><button>{{'Discord speichern' if cfg.language=='de' else 'Save Discord settings'}}</button></form><p><small>Bot: {{'Token gespeichert' if cfg.discord_token else 'Noch nicht eingerichtet'}}. Befehle: /dashboard, /miners, /miner1 bis /miner20, /start, /pause, /restart. Steuerbefehle erfordern Discord-Adminrechte oder freigegebene Rollen.</small></p></section>
-<p class="muted">* Leistung ist ein HarloOS-Schätzwert. Blockalarm basiert auf Änderungen des blocks_mined-Zählers. Beim ersten Abruf wird nur ein Basiswert gespeichert.</p></main><script>async function update(){try{let d=await(await fetch('/api/live')).json();document.getElementById('live').innerHTML=d.map(m=>'<div class="tile"><b>'+esc(m.name)+'</b> · '+(m.online?'ONLINE':'OFFLINE')+'<div class="grid">'+Object.entries(m.values).map(([k,v])=>'<div><small>'+esc(k)+'</small><br>'+esc(v)+'</div>').join('')+'</div></div>').join('')||'Noch keine Miner';}catch(e){document.getElementById('live').textContent='Verbindung fehlgeschlagen'}}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}update();setInterval(update,10000)</script></body></html>'''
+<p class="muted">* Leistung ist ein HarloOS-Schätzwert. Blockalarm basiert auf Änderungen des blocks_mined-Zählers. Beim ersten Abruf wird nur ein Basiswert gespeichert.</p></main><script>
+const graphTempLimits={
+    asicYellow:{{ cfg.temp_limits.asic_yellow|int }},
+    asicRed:{{ cfg.temp_limits.asic_red|int }},
+    vrYellow:{{ cfg.temp_limits.vr_yellow|int }},
+    vrRed:{{ cfg.temp_limits.vr_red|int }}
+};
+let graphMinutes=5;
+let graphBusy=false;
+let graphData={};
+
+document.querySelectorAll('[data-graph-metric]').forEach(box=>{
+    box.addEventListener('change',()=>drawGraph(graphData));
+});
+
+
+const graphMetrics=[
+    ['hashrate_ghs','#86efac'],
+    ['device_power_w','#e7b66e'],
+    ['asic_temp_c','#38bdf8'],
+    ['vr_temp_c','#facc15'],
+    ['fans','#c084fc'],
+    ['free_ram','#fb7185']
+];
+
+function updateGraphLegend(data){
+    const points=Object.values(data)
+        .flat()
+        .filter(p=>p && p.values)
+        .sort((a,b)=>b.time-a.time);
+
+    const units={
+        hashrate_ghs:' GH/s',
+        device_power_w:' W',
+        asic_temp_c:' °C',
+        vr_temp_c:' °C',
+        fans:' %',
+        free_ram:''
+    };
+
+    document.querySelectorAll('[data-graph-metric]').forEach(box=>{
+        const metric=box.dataset.graphMetric;
+        const latest=points.find(p=>
+            typeof p.values[metric]==='number' &&
+            Number.isFinite(p.values[metric])
+        );
+        const label=box.parentElement.querySelector('span');
+        if(!label)return;
+
+        const name=label.textContent.split(' · ')[0];
+        const value=latest
+            ? latest.values[metric].toLocaleString('de-DE',{
+                maximumFractionDigits:2
+              })+(units[metric]||'')
+            : 'keine Daten';
+
+        label.textContent=name+' · '+value;
+    });
+}
+
+function graphValueColor(metric,value,defaultColor){
+    if(metric!=='asic_temp_c' && metric!=='vr_temp_c'){
+        return defaultColor;
+    }
+    const isAsic=metric==='asic_temp_c';
+    const yellow=isAsic?graphTempLimits.asicYellow:graphTempLimits.vrYellow;
+    const red=isAsic?graphTempLimits.asicRed:graphTempLimits.vrRed;
+    if(value>=red)return '#fb7185';
+    if(value>=yellow)return '#facc15';
+    return '#86efac';
+}
+
+function drawGraph(data){
+    const canvas=document.getElementById('live-graph');
+    const ctx=canvas.getContext('2d');
+    const w=canvas.width,h=canvas.height;
+    const left=45,right=w-20,top=20,bottom=h-35;
+
+    ctx.clearRect(0,0,w,h);
+    ctx.strokeStyle='#263641';
+    ctx.lineWidth=1;
+
+    for(let i=0;i<=4;i++){
+        const y=top+(bottom-top)*i/4;
+        ctx.beginPath();
+        ctx.moveTo(left,y);
+        ctx.lineTo(right,y);
+        ctx.stroke();
+    }
+
+    const now=Date.now()/1000;
+    const start=now-graphMinutes*60;
+
+    ctx.fillStyle='#9ca3af';
+    ctx.font='13px sans-serif';
+    ctx.textAlign='center';
+
+    for(let i=0;i<=4;i++){
+        const timestamp=start+(now-start)*i/4;
+        const date=new Date(timestamp*1000);
+        const label=date.toLocaleTimeString('de-DE',{
+            hour:'2-digit',
+            minute:'2-digit'
+        });
+        const x=left+(right-left)*i/4;
+        ctx.fillText(label,x,h-12);
+    }
+
+    const miners=Object.values(data);
+
+    graphMetrics.forEach(([metric,color])=>{
+        const toggle=document.querySelector('[data-graph-metric="'+metric+'"]');
+        if(toggle && !toggle.checked)return;
+        const points=miners.flat().filter(p=>
+            p && p.values &&
+            typeof p.values[metric]==='number' &&
+            Number.isFinite(p.values[metric])
+        );
+        if(!points.length)return;
+
+        const values=points.map(p=>p.values[metric]);
+        let min=Infinity;
+        let max=-Infinity;
+        for(const value of values){
+            if(value<min)min=value;
+            if(value>max)max=value;
+        }
+        const span=max-min||1;
+
+        ctx.lineWidth=2;
+        miners.forEach(series=>{
+            let previous=null;
+            series.forEach(p=>{
+                const value=p.values && p.values[metric];
+                if(typeof value!=='number'||!Number.isFinite(value)){
+                    previous=null;
+                    return;
+                }
+                const x=left+(p.time-start)/(graphMinutes*60)*(right-left);
+                const y=bottom-(value-min)/span*(bottom-top);
+                if(x<left||x>right){
+                    previous=null;
+                    return;
+                }
+                if(previous){
+                    ctx.beginPath();
+                    ctx.strokeStyle=graphValueColor(metric,value,color);
+                    ctx.moveTo(previous.x,previous.y);
+                    ctx.lineTo(x,y);
+                    ctx.stroke();
+                }
+                previous={x,y};
+            });
+        });
+    });
+}
+
+async function updateGraph(){
+    if(graphBusy)return;
+    graphBusy=true;
+    try{
+        const response=await fetch('/api/history?minutes='+graphMinutes);
+        if(!response.ok)throw new Error('HTTP '+response.status);
+        const data=await response.json();graphData=data;updateGraphLegend(graphData);drawGraph(graphData);
+        const count=Object.values(data).reduce((sum,points)=>sum+points.length,0);
+        document.getElementById('graph-status').textContent=
+            count+' Messpunkte · Zeitraum: '+graphMinutes+' Minuten';
+    }catch(error){
+        document.getElementById('graph-status').textContent='Graph-Daten nicht erreichbar';
+    }finally{
+        graphBusy=false;
+    }
+}
+
+document.querySelectorAll('[data-minutes]').forEach(button=>{
+    button.addEventListener('click',()=>{
+        graphMinutes=Number(button.dataset.minutes);
+        updateGraph();
+    });
+});
+
+let liveBusy=false;async function update(){if(liveBusy)return;liveBusy=true;try{let d=await(await fetch('/api/live')).json();document.getElementById('live').innerHTML=d.map(m=>'<div class="tile"><b>'+esc(m.name)+'</b> · '+(m.online?'ONLINE':'OFFLINE')+'<div class="grid">'+Object.entries(m.values).map(([k,v])=>'<div><small>'+esc(k)+'</small><br><strong style="color:'+esc((m.colors||{})[k]||'#ecf8f7')+'">'+esc(v)+'</strong></div>').join('')+'</div></div>').join('')||'Noch keine Miner';}catch(e){document.getElementById('live').textContent='Verbindung fehlgeschlagen'}finally{liveBusy=false}}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}update();
+updateGraph();
+setInterval(update,{{ cfg.refresh_seconds|int }}*1000);
+setInterval(updateGraph,10000)</script></body></html>'''
 @app.get('/')
 @auth
 def home():
@@ -112,12 +412,27 @@ def design():
         v=request.form.get(k,'')
         if len(v)==7 and v[0]=='#' and all(c in '0123456789abcdefABCDEF' for c in v[1:]): d['theme'][k]=v
     d['fields']=[x for x in request.form.getlist('fields') if x in FIELDS]
-    try:d['refresh_seconds']=max(5,min(300,int(request.form.get('refresh','10'))))
+    try:d['refresh_seconds']=max(2,min(300,int(request.form.get('refresh','10'))))
     except ValueError:pass
     d['font_family']=request.form.get('font_family','dejavu') if request.form.get('font_family') in FONT_OPTIONS else 'dejavu'
     for key,low,high,default in [('font_title_size',24,66,43),('font_value_size',20,58,38),('font_label_size',14,32,22)]:
         try: d[key]=max(low,min(high,int(request.form.get(key,default))))
         except (ValueError,TypeError): d[key]=default
+    limits = dict(DEFAULT['temp_limits'])
+    limits.update(d.get('temp_limits') or {})
+    try:
+        values = {
+            key: int(request.form.get(key, limits[key]))
+            for key in limits
+        }
+        if (
+            all(0 <= v <= 120 for v in values.values())
+            and values['asic_yellow'] < values['asic_red']
+            and values['vr_yellow'] < values['vr_red']
+        ):
+            d['temp_limits'] = values
+    except (ValueError, TypeError):
+        pass
     save(d);return redirect('/')
 @app.post('/discord')
 @auth
@@ -144,7 +459,45 @@ def reset_block():
 @app.get('/api/live')
 @auth
 def live():
-    return jsonify([{'name':m['name'],'ip':m['ip'],'online':m['online'],'values':{FIELDS.get(k,k):v for k,v in m['values'].items()}} for m in scan()])
+    miners = scan()
+    record_history(miners)
+    return jsonify([{'name':m['name'],'ip':m['ip'],'online':m['online'],'values':{FIELDS.get(k,k):v for k,v in m['values'].items()},'colors':{FIELDS.get(k,k):v for k,v in m['colors'].items()}} for m in miners])
+
+
+@app.get('/api/history')
+@auth
+def history_api():
+    try:
+        minutes = int(request.args.get('minutes', 5))
+    except (TypeError, ValueError):
+        minutes = 5
+    if minutes not in (5, 15, 60, 1440):
+        minutes = 5
+
+    cutoff = int(time.time()) - minutes * 60
+
+    with HISTORY_LOCK:
+        try:
+            history = json.loads(HISTORY_FILE.read_text())
+            if not isinstance(history, dict):
+                history = {}
+        except (OSError, ValueError):
+            history = {}
+
+    result = {}
+    for miner in config()['miners']:
+        ip = miner['ip']
+        points = history.get(ip, [])
+        if not isinstance(points, list):
+            points = []
+        result[ip] = [
+            point for point in points
+            if isinstance(point, dict)
+            and isinstance(point.get('time'), (int, float))
+            and point['time'] >= cutoff
+        ]
+
+    return jsonify(result)
 
 FONT_OPTIONS={
     'dejavu':'DejaVu Sans (Modern)',
@@ -184,11 +537,18 @@ def image_dashboard(index=None):
     value_size=max(20,min(58,int(d.get('font_value_size',38))))
     label_size=max(14,min(32,int(d.get('font_label_size',22))))
     vals=list((m['values'] if m else {}).items())
+    priority={'hashrate_ghs':0,'device_power_w':1}
+    vals.sort(key=lambda item: priority.get(item[0],2))
+    hero_keys={'hashrate_ghs','device_power_w'}
+    hero_vals=[item for item in vals if item[0] in hero_keys]
+    detail_vals=[item for item in vals if item[0] not in hero_keys]
     cols=2 if len(vals)<=10 else 3
-    rows=max(1,(len(vals)+cols-1)//cols)
+    rows=(len(detail_vals)+cols-1)//cols
     card_h=132 if cols==2 else 124
+    hero_h=170 if hero_vals else 0
+    hero_space=hero_h+20 if hero_vals else 0
     top=184+(108 if alert else 0)
-    height=max(690,top+rows*(card_h+12)+30)
+    height=max(690,top+hero_space+rows*(card_h+12)+30)
     im=Image.new('RGB',(1000,height),theme['bg']); draw=ImageDraw.Draw(im)
     heading,heading_font=fit_text(draw,d['title'],750,title_size,family,20)
     draw.text((36,27),heading,fill=theme['accent'],font=heading_font)
@@ -209,14 +569,27 @@ def image_dashboard(index=None):
     status_text,status_font=fit_text(draw,status,910,29,family,17)
     draw.text((36,y),status_text,fill=theme['text'],font=status_font)
     y+=78
-    margin=30;gap=14; card_w=(1000-2*margin-(cols-1)*gap)//cols
-    for n,(k,v) in enumerate(vals):
+    margin=30;gap=14
+    if hero_vals:
+        hero_gap=14
+        hero_w=(1000-2*margin-(len(hero_vals)-1)*hero_gap)//len(hero_vals)
+        for n,(k,v) in enumerate(hero_vals):
+            x=margin+n*(hero_w+hero_gap)
+            draw.rounded_rectangle((x,y,x+hero_w,y+hero_h),radius=18,fill=theme['panel'])
+            label,lf=fit_text(draw,FIELDS.get(k,k).upper(),hero_w-36,24,family,15)
+            value,vf=fit_text(draw,v,hero_w-36,58,family,22)
+            draw.text((x+20,y+20),label,fill=theme['text'],font=lf)
+            draw.text((x+20,y+85),value,
+                      fill=(m.get('colors') or {}).get(k,theme['accent']),font=vf)
+        y+=hero_space
+    card_w=(1000-2*margin-(cols-1)*gap)//cols
+    for n,(k,v) in enumerate(detail_vals):
         col=n%cols;row=n//cols;x=margin+col*(card_w+gap);yy=y+row*(card_h+12)
         draw.rounded_rectangle((x,yy,x+card_w,yy+card_h),radius=14,fill=theme['panel'])
         label,lf=fit_text(draw,FIELDS.get(k,k),card_w-30,label_size,family,13)
         value,vf=fit_text(draw,v,card_w-30,value_size,family,17)
         draw.text((x+16,yy+13),label,fill=theme['text'],font=lf)
-        draw.text((x+16,yy+card_h-15-vf.getbbox(value)[3]),value,fill=theme['accent'],font=vf)
+        draw.text((x+16,yy+card_h-15-vf.getbbox(value)[3]),value,fill=(m.get('colors') or {}).get(k,theme['accent']),font=vf)
     out=io.BytesIO();im.save(out,format='PNG');out.seek(0);return out
 @app.get('/preview.png')
 @auth
