@@ -3,22 +3,193 @@ from pathlib import Path
 from functools import wraps
 from flask import Flask, request, redirect, render_template_string, jsonify, send_file, abort, session
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 ROOT=Path('/app/data'); ROOT.mkdir(parents=True,exist_ok=True)
 FILE=ROOT/'settings.json'
 HISTORY_FILE=ROOT/'history.json'
 GRAPH_FIELDS=('hashrate_ghs','device_power_w','asic_temp_c','vr_temp_c','fans','free_ram')
-DEFAULT={'miners':[],'discord_token':'','discord_channel_id':'','discord_guild_id':'','admin_role_ids':'','title':'BITAXE LIVE','refresh_seconds':10,'temp_limits':{'asic_yellow':60,'asic_red':70,'vr_yellow':65,'vr_red':80},'theme':{'bg':'#0b1116','panel':'#17242a','text':'#ecf8f7','accent':'#46e0c2'},'fields':['hashrate_ghs','asic_temp_c','vr_temp_c','device_power_w','fans','accepted_shares','rejected_shares','best_share_all_time','uptime_seconds'],'selected':0,'block_alert':None,'block_baselines':{},'logo':False,'dashboard_message_id':'','font_family':'dejavu','font_title_size':43,'font_value_size':38,'font_label_size':22,'language':'de','setup_complete':True,'bot_enabled':False}
+DEFAULT={'miners':[],'discord_token':'','discord_channel_id':'','discord_guild_id':'','admin_role_ids':'','title':'BITAXE LIVE','refresh_seconds':10,'temp_limits':{'asic_yellow':60,'asic_red':70,'vr_yellow':65,'vr_red':80},'theme':{'bg':'#0b1116','panel':'#17242a','text':'#ecf8f7','accent':'#46e0c2'},'fields':['hashrate_ghs','asic_temp_c','vr_temp_c','device_power_w','fans','accepted_shares','rejected_shares','best_share_all_time','uptime_seconds'],'selected':0,'block_alert':None,'block_baselines':{},'logo':False,'background_enabled':False,'panel_opacity':100,'graph_bg':'#17262b','graph_opacity':100,'background_dim':0,'background_fit':'cover','dashboard_message_id':'','font_family':'dejavu','font_title_size':43,'font_value_size':38,'font_label_size':22,'language':'de','setup_complete':False,'bot_enabled':False,'discord_bots':[]}
 LOCK=threading.RLock(); app=Flask(__name__); app.secret_key=os.environ.get('APP_SECRET',os.urandom(32).hex())
 logging.basicConfig(level=logging.INFO)
 
 def config():
     with LOCK:
-        try: d=json.loads(FILE.read_text()); return {**DEFAULT,**d,'theme':{**DEFAULT['theme'],**d.get('theme',{})},'temp_limits':{**DEFAULT['temp_limits'],**d.get('temp_limits',{})}}
+        try:
+            d = json.loads(FILE.read_text())
+            d = migrate_discord_bots(d)
+            return {**DEFAULT,**d,'theme':{**DEFAULT['theme'],**d.get('theme',{})},'temp_limits':{**DEFAULT['temp_limits'],**d.get('temp_limits',{})}}
         except (FileNotFoundError,ValueError): return dict(DEFAULT)
+
+def discord_bot_defaults():
+    commands = {
+        'dashboard': True,
+        'miners': True,
+        'start': True,
+        'pause': True,
+        'restart': True,
+    }
+    commands.update({
+        f'miner{i}': True
+        for i in range(1, 21)
+    })
+    return commands
+
+def migrate_discord_bots(d):
+    """Bestehenden Discord-Bot einmalig in die neue Struktur übernehmen."""
+    if d.get('discord_bots_migrated', False):
+        return d
+
+    if d.get('discord_bots'):
+        d['discord_bots_migrated'] = True
+        return d
+
+    if not d.get('discord_token'):
+        return d
+
+    d['discord_bots'] = [{
+        'id': 'bot1',
+        'name': 'Hauptbot',
+        'token': d.get('discord_token', ''),
+        'channel_id': d.get('discord_channel_id', ''),
+        'guild_id': d.get('discord_guild_id', ''),
+        'admin_role_ids': d.get('admin_role_ids', ''),
+        'dashboard_message_id': d.get('dashboard_message_id', ''),
+        'synced_guild_id': '',
+        'enabled': bool(d.get('bot_enabled', False)),
+        'commands_enabled': True,
+    }]
+    d['discord_bots_migrated'] = True
+    return d
+
+
+def find_discord_bot(d, bot_id):
+    """Discord-Bot anhand seiner eindeutigen ID finden."""
+    for bot in d.get('discord_bots', []):
+        if isinstance(bot, dict) and bot.get('id') == bot_id:
+            return bot
+    return None
+
+def discord_bot_name(bot):
+    """Anzeigenamen eines Discord-Bots zurückgeben."""
+    return str(bot.get('name', 'Discord-Bot'))[:50]
+
+
+def create_discord_bot(d, name):
+    """Neuen Discord-Bot mit eigenen Einstellungen anlegen."""
+    import uuid
+
+    bot = {
+        'id': 'bot_' + uuid.uuid4().hex[:12],
+        'name': str(name).strip()[:50] or 'Neuer Discord-Bot',
+        'token': '',
+        'channel_id': '',
+        'guild_id': '',
+        'admin_role_ids': '',
+        'dashboard_message_id': '',
+        'synced_guild_id': '',
+        'enabled': False,
+        'commands_enabled': True,
+    }
+
+    d.setdefault('discord_bots', []).append(bot)
+    return bot
+
+
+def current_discord_bot(bot_id):
+    """Aktuelle Einstellungen eines bestimmten Discord-Bots abrufen."""
+    d = config()
+    return find_discord_bot(d, bot_id)
+
+
+
+def save_discord_message_id(bot_id, token, channel_id, message_id):
+    """Dashboard-Nachrichten-ID sicher einem bestimmten Bot zuordnen."""
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, bot_id)
+
+        if bot is None:
+            return False
+
+        if not bot.get('enabled', False):
+            return False
+
+        if bot.get('token') != token:
+            return False
+
+        if str(bot.get('channel_id', '')) != str(channel_id):
+            return False
+
+        bot['dashboard_message_id'] = str(message_id)
+        save(d)
+        return True
+
+
+
+
+def save_discord_sync_state(bot_id, token, guild_id, commands_enabled):
+    """Zuletzt erfolgreich synchronisierten Discord-Zustand speichern."""
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, bot_id)
+
+        if bot is None:
+            return False
+
+        if not bot.get('enabled', False):
+            return False
+
+        if bot.get('token', '') != token:
+            return False
+
+        if str(bot.get('guild_id', '')).strip() != str(guild_id).strip():
+            return False
+
+        if bool(bot.get('commands_enabled', True)) != bool(commands_enabled):
+            return False
+
+        bot['synced_guild_id'] = str(guild_id).strip()
+        bot['synced_commands_enabled'] = bool(commands_enabled)
+        save(d)
+        return True
+
+
+
+def update_discord_bot(bot_id, changes):
+    """Bot-Einstellungen atomar lesen, ändern und speichern."""
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, bot_id)
+
+        if bot is None:
+            return False
+
+        if not isinstance(changes, dict):
+            raise ValueError('Ungültige Bot-Einstellungen')
+
+        bot.update(changes)
+        save(d)
+        return True
+
+
+def active_discord_bots():
+    """Alle aktivierten Discord-Bots ermitteln."""
+    d = config()
+    bots = d.get('discord_bots', [])
+
+    return [
+        bot.copy()
+        for bot in bots
+        if isinstance(bot, dict)
+        and bot.get('enabled', False)
+        and bot.get('token')
+    ]
+
+
 def save(d):
     with LOCK:
+        d = migrate_discord_bots(d)
         p=FILE.with_suffix('.tmp'); p.write_text(json.dumps(d,indent=2)); p.replace(FILE)
 
 HISTORY_LOCK = threading.RLock()
@@ -64,9 +235,9 @@ def record_history(miners):
                 points = []
             points = [point for point in points if isinstance(point, dict) and point.get('time', 0) >= cutoff]
             old_points = history.get(ip, [])
-            if not points or now - points[-1].get('time', 0) >= 10:
+            if not points or now - points[-1].get('time', 0) >= 2:
                 points.append({'time': now, 'values': values})
-            points = points[-8640:]
+            points = points[-43200:]
             if points != old_points:
                 history[ip] = points
                 changed = True
@@ -119,7 +290,7 @@ def value_color(key, value, limits):
             if temp >= limits[prefix + '_red']:
                 return '#fb7185'
             if temp >= limits[prefix + '_yellow']:
-                return '#facc15'
+                return '#fb923c'
             return '#86efac'
         except (TypeError, ValueError, KeyError):
             return '#a1b5b7'
@@ -189,15 +360,117 @@ PAGE='''<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="v
 <canvas id="live-graph" width="960" height="360" style="width:100%;max-width:100%;background:#0b1116;border-radius:12px"></canvas>
 </section>
 <section><h2>{{'Miner verwalten' if cfg.language=='de' else 'Manage miners'}}</h2>{% for m in cfg.miners %}<form method="post" action="/remove/{{loop.index0}}"><b>{{m.name}}</b> <span class="muted">{{m.ip}}</span><button class="danger">{{'Entfernen' if cfg.language=='de' else 'Remove'}}</button></form>{% endfor %}<form method="post" action="/add"><input name="name" placeholder="Miner-Name" maxlength="50" required><input name="ip" placeholder="192.168.178.24" required><button>{{'Miner hinzufügen' if cfg.language=='de' else 'Add miner'}}</button></form></section>
-<section><h2>{{'Dashboard-Design' if cfg.language=='de' else 'Dashboard design'}}</h2><form method="post" action="/design"><input name="title" value="{{cfg.title}}" maxlength="70" placeholder="Titel"><label>Hintergrund <input type="color" name="bg" value="{{cfg.theme.bg}}"></label><label>Karten <input type="color" name="panel" value="{{cfg.theme.panel}}"></label><label>Schrift <input type="color" name="text" value="{{cfg.theme.text}}"></label><label>Akzent <input type="color" name="accent" value="{{cfg.theme.accent}}"></label><div style="width:100%"><b>Werte anzeigen:</b><br>{% for key,label in fields.items() %}<label><input type="checkbox" name="fields" value="{{key}}" {% if key in cfg.fields %}checked{% endif %}>{{label}}</label>{% endfor %}</div><div style="width:100%;display:flex;flex-wrap:wrap;gap:12px;align-items:center"><label>Schriftart <select name="font_family">{% for key,name in font_options.items() %}<option value="{{key}}" {% if cfg.font_family==key %}selected{% endif %}>{{name}}</option>{% endfor %}</select></label><label>Titelgröße <input type="range" name="font_title_size" min="24" max="66" value="{{cfg.font_title_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_title_size}}</output></label><label>Messwertgröße <input type="range" name="font_value_size" min="20" max="58" value="{{cfg.font_value_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_value_size}}</output></label><label>Beschriftungsgröße <input type="range" name="font_label_size" min="14" max="32" value="{{cfg.font_label_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_label_size}}</output></label></div><div style="width:100%">
+<section><h2>{{'Dashboard-Design' if cfg.language=='de' else 'Dashboard design'}}</h2><form method="post" action="/design"><input name="title" value="{{cfg.title}}" maxlength="70" placeholder="Titel"><label>Hintergrund <input type="color" name="bg" value="{{cfg.theme.bg}}"></label><label>Karten <input type="color" name="panel" value="{{cfg.theme.panel}}"></label><label>Schrift <input type="color" name="text" value="{{cfg.theme.text}}"></label><label>Akzent <input type="color" name="accent" value="{{cfg.theme.accent}}"></label><div style="width:100%"><b>Werte anzeigen:</b><br>{% for key,label in fields.items() %}<label><input type="checkbox" name="fields" value="{{key}}" {% if key in cfg.fields %}checked{% endif %}>{{label}}</label>{% endfor %}</div><div style="width:100%;display:flex;flex-wrap:wrap;gap:12px;align-items:center"><label>Schriftart <select name="font_family">{% for key,name in font_options.items() %}<option value="{{key}}" {% if cfg.font_family==key %}selected{% endif %}>{{name}}</option>{% endfor %}</select></label><label>Titelgröße <input type="range" name="font_title_size" min="24" max="66" value="{{cfg.font_title_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_title_size}}</output></label><label>Messwertgröße <input type="range" name="font_value_size" min="20" max="58" value="{{cfg.font_value_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_value_size}}</output></label><label>Beschriftungsgröße <input type="range" name="font_label_size" min="14" max="32" value="{{cfg.font_label_size}}" oninput="this.nextElementSibling.textContent=this.value"><output>{{cfg.font_label_size}}</output></label></div>
+<div style="width:100%;padding:15px 0">
+<b>🎨 Hintergrundbild & Transparenz</b>
+<p class="muted">Passe die Darstellung deiner Discord-Grafik an.</p>
+
+<label>Kartendeckkraft
+<input type="range" name="panel_opacity" min="0" max="100"
+value="{{cfg.panel_opacity}}"
+oninput="this.nextElementSibling.textContent=this.value+' %'">
+<output>{{cfg.panel_opacity}} %</output>
+</label>
+
+<label>Hintergrund-Abdunklung
+<input type="range" name="background_dim" min="0" max="90"
+value="{{cfg.background_dim}}"
+oninput="this.nextElementSibling.textContent=this.value+' %'">
+<output>{{cfg.background_dim}} %</output>
+</label>
+
+<label>Graph-Hintergrundfarbe
+<input type="color" name="graph_bg" value="{{cfg.graph_bg}}">
+</label>
+
+<label>Gitternetzfarbe
+<input type="color" name="graph_grid_color"
+value="{{cfg.graph_grid_color|default('#34444b')}}">
+</label>
+
+<label>Graph-Deckkraft
+<input type="range" name="graph_opacity" min="0" max="100"
+value="{{cfg.graph_opacity}}"
+oninput="this.nextElementSibling.textContent=this.value+' %'">
+<output>{{cfg.graph_opacity}} %</output>
+</label>
+
+<label>Bildanpassung
+<select name="background_fit">
+<option value="cover" {% if cfg.background_fit=='cover' %}selected{% endif %}>Ausfüllen</option>
+<option value="contain" {% if cfg.background_fit=='contain' %}selected{% endif %}>Einpassen</option>
+</select>
+</label>
+</div>
+<div style="width:100%">
 <b>🌡️ Temperatur-Farben (°C)</b>
-<p class="muted">Grün unter Gelb, Gelb bis Rot, Rot ab der roten Grenze.</p>
-<label>ASIC Gelb ab <input type="number" name="asic_yellow" min="0" max="120" value="{{cfg.temp_limits.asic_yellow}}"></label>
+<p class="muted">Grün unter Orange, Orange bis Rot, Rot ab der roten Grenze.</p>
+<label>ASIC Orange ab <input type="number" name="asic_yellow" min="0" max="120" value="{{cfg.temp_limits.asic_yellow}}"></label>
 <label>ASIC Rot ab <input type="number" name="asic_red" min="0" max="120" value="{{cfg.temp_limits.asic_red}}"></label>
-<label>VR Gelb ab <input type="number" name="vr_yellow" min="0" max="120" value="{{cfg.temp_limits.vr_yellow}}"></label>
+<label>VR Orange ab <input type="number" name="vr_yellow" min="0" max="120" value="{{cfg.temp_limits.vr_yellow}}"></label>
 <label>VR Rot ab <input type="number" name="vr_red" min="0" max="120" value="{{cfg.temp_limits.vr_red}}"></label>
-</div><label>Intervall (Sekunden) <input type="number" name="refresh" min="2" max="300" value="{{cfg.refresh_seconds}}"></label><button>{{'Design speichern' if cfg.language=='de' else 'Save design'}}</button></form><form action="/logo" method="post" enctype="multipart/form-data"><label>Eigenes Logo (PNG/JPG, 128×128 empfohlen) <input type="file" name="logo" accept="image/png,image/jpeg" required></label><button>{{'Logo hochladen' if cfg.language=='de' else 'Upload logo'}}</button></form><p><img class="preview" src="/preview.png?t={{stamp}}" alt="Dashboard Vorschau"></p></section>
-<section><h2>Discord-Bot</h2><p><b>{{'Status' if cfg.language=='de' else 'Status'}}:</b> {{'🟢 Aktiviert' if cfg.bot_enabled else '⚪ Gestoppt'}}</p><form method="post" action="/bot-toggle"><button>{{'Bot stoppen' if cfg.bot_enabled else 'Bot starten'}}</button></form><p class="muted">Bot im Discord Developer Portal anlegen, Token hier hinterlegen und Bot mit bot + applications.commands Berechtigungen einladen. Token niemals öffentlich teilen.</p><form method="post" action="/discord"><input type="password" name="token" placeholder="Neuer Bot-Token (leer = behalten)"><input name="channel" value="{{cfg.discord_channel_id}}" placeholder="Discord Channel ID"><input name="guild" value="{{cfg.discord_guild_id}}" placeholder="Server/Guild ID"><input name="roles" value="{{cfg.admin_role_ids}}" placeholder="Admin-Rollen-IDs, kommagetrennt"><button>{{'Discord speichern' if cfg.language=='de' else 'Save Discord settings'}}</button></form><p><small>Bot: {{'Token gespeichert' if cfg.discord_token else 'Noch nicht eingerichtet'}}. Befehle: /dashboard, /miners, /miner1 bis /miner20, /start, /pause, /restart. Steuerbefehle erfordern Discord-Adminrechte oder freigegebene Rollen.</small></p></section>
+</div><label>Intervall (Sekunden) <input type="number" name="refresh" min="2" max="300" value="{{cfg.refresh_seconds}}"></label><button>{{'Design speichern' if cfg.language=='de' else 'Save design'}}</button></form><form action="/logo" method="post" enctype="multipart/form-data"><label>Eigenes Logo (PNG/JPG, 128×128 empfohlen) <input type="file" name="logo" accept="image/png,image/jpeg" required></label><button>{{'Logo hochladen' if cfg.language=='de' else 'Upload logo'}}</button></form><div style="width:100%;margin-top:18px">
+<h3>🖼️ Eigenes Hintergrundbild</h3>
+<p class="muted">PNG oder JPG, maximal 5 MB. Das Bild wird für die Discord-Grafik verwendet.</p>
+<form method="post" action="/background-upload" enctype="multipart/form-data">
+<label>Hintergrundbild auswählen
+<input type="file" name="background" accept="image/png,image/jpeg" required>
+</label>
+<button>Hintergrundbild hochladen</button>
+</form>
+{% if cfg.background_enabled %}
+<form method="post" action="/background-remove">
+<button class="danger">Hintergrundbild entfernen</button>
+</form>
+{% endif %}
+</div>
+<p><img class="preview" src="/preview.png?t={{stamp}}" alt="Dashboard Vorschau"></p></section>
+
+<section>
+<h2>🤖 Discord-Bots verwalten</h2>
+<p class="muted">Jeder Bot hat eigene Discord-Zugangsdaten, einen eigenen Kanal und unabhängige Schalter.</p>
+
+{% for bot in cfg.discord_bots %}
+<div style="border:1px solid #45616a;border-radius:12px;padding:16px;margin:15px 0">
+<h3>{{bot.name}}</h3>
+
+<p>
+Status: {{'🟢 Aktiviert' if bot.enabled else '⚪ Gestoppt'}}
+<br>
+Slash-Befehle: {{'🟢 Aktiviert' if bot.commands_enabled else '🔴 Deaktiviert'}}
+</p>
+
+<form method="post" action="/discord-bots/toggle">
+<input type="hidden" name="bot_id" value="{{bot.id}}">
+<button>{{'Bot stoppen' if bot.enabled else 'Bot starten'}}</button>
+</form>
+
+<form method="post" action="/discord-bots/commands-toggle">
+<input type="hidden" name="bot_id" value="{{bot.id}}">
+<button>{{'Alle Befehle AUS' if bot.commands_enabled else 'Alle Befehle EIN'}}</button>
+</form>
+
+<form method="post" action="/discord-bots/edit">
+<input type="hidden" name="bot_id" value="{{bot.id}}">
+<label>Bot-Name <input name="name" value="{{bot.name}}" required></label>
+<label>Bot-Token <input type="password" name="token" placeholder="Leer lassen = bisherigen Token behalten"></label>
+<label>Discord Server-ID <input name="guild" value="{{bot.guild_id}}"></label>
+<label>Discord Kanal-ID <input name="channel" value="{{bot.channel_id}}"></label>
+<label>Admin-Rollen-IDs <input name="roles" value="{{bot.admin_role_ids}}"></label>
+<button>Einstellungen speichern</button>
+</form>
+</div>
+{% endfor %}
+
+<h3>➕ Weiteren Discord-Bot hinzufügen</h3>
+<form method="post" action="/discord-bots/add">
+<label>Bot-Name <input name="name" placeholder="z. B. Zweiter Discord-Server" maxlength="50" required></label>
+<button>Bot hinzufügen</button>
+</form>
+
+<p class="muted">Maximal 10 Bots. Die Befehle /dashboard, /miners, /miner1 bis /miner20, /start, /pause und /restart werden gemeinsam ein- oder ausgeschaltet. Admin-Berechtigungen bleiben erhalten.</p>
+</section>
+
 <p class="muted">* Leistung ist ein HarloOS-Schätzwert. Blockalarm basiert auf Änderungen des blocks_mined-Zählers. Beim ersten Abruf wird nur ein Basiswert gespeichert.</p></main><script>
 const graphTempLimits={
     asicYellow:{{ cfg.temp_limits.asic_yellow|int }},
@@ -266,7 +539,7 @@ function graphValueColor(metric,value,defaultColor){
     const yellow=isAsic?graphTempLimits.asicYellow:graphTempLimits.vrYellow;
     const red=isAsic?graphTempLimits.asicRed:graphTempLimits.vrRed;
     if(value>=red)return '#fb7185';
-    if(value>=yellow)return '#facc15';
+    if(value>=yellow)return '#fb923c';
     return '#86efac';
 }
 
@@ -418,6 +691,43 @@ def design():
     for key,low,high,default in [('font_title_size',24,66,43),('font_value_size',20,58,38),('font_label_size',14,32,22)]:
         try: d[key]=max(low,min(high,int(request.form.get(key,default))))
         except (ValueError,TypeError): d[key]=default
+    for key, low, high, default in [
+        ('panel_opacity', 0, 100, 100),
+        ('background_dim', 0, 90, 0),
+    ]:
+        try:
+            d[key] = max(low, min(high, int(request.form.get(key, d.get(key, default)))))
+        except (ValueError, TypeError):
+            d[key] = default
+    grid_color = request.form.get(
+        'graph_grid_color', d.get('graph_grid_color', '#34444b')
+    )
+    if (
+        len(grid_color) == 7
+        and grid_color.startswith('#')
+        and all(c in '0123456789abcdefABCDEF' for c in grid_color[1:])
+    ):
+        d['graph_grid_color'] = grid_color
+
+    graph_color = request.form.get('graph_bg', d.get('graph_bg', '#17262b'))
+    if (
+        len(graph_color) == 7
+        and graph_color.startswith('#')
+        and all(c in '0123456789abcdefABCDEF' for c in graph_color[1:])
+    ):
+        d['graph_bg'] = graph_color
+
+    try:
+        d['graph_opacity'] = max(
+            0, min(100, int(request.form.get(
+                'graph_opacity', d.get('graph_opacity', 100)
+            )))
+        )
+    except (ValueError, TypeError):
+        d['graph_opacity'] = 100
+
+    fit = request.form.get('background_fit', d.get('background_fit', 'cover'))
+    d['background_fit'] = fit if fit in ('cover', 'contain') else 'cover'
     limits = dict(DEFAULT['temp_limits'])
     limits.update(d.get('temp_limits') or {})
     try:
@@ -434,13 +744,138 @@ def design():
     except (ValueError, TypeError):
         pass
     save(d);return redirect('/')
+@app.post('/discord-bots/toggle')
+@auth
+def discord_bot_toggle():
+    bot_id = request.form.get('bot_id', '')
+
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, bot_id)
+
+        if bot is None:
+            abort(404, 'Discord-Bot nicht gefunden')
+
+        if not bot.get('enabled', False) and not bot.get('token'):
+            abort(400, 'Bitte zuerst einen Bot-Token hinterlegen')
+
+        bot['enabled'] = not bot.get('enabled', False)
+        save(d)
+
+    return redirect('/')
+
+
+@app.post('/discord-bots/commands-toggle')
+@auth
+def discord_bot_commands_toggle():
+    bot_id = request.form.get('bot_id', '')
+
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, bot_id)
+
+        if bot is None:
+            abort(404, 'Discord-Bot nicht gefunden')
+
+        bot['commands_enabled'] = not bot.get(
+            'commands_enabled', True
+        )
+
+        save(d)
+
+    return redirect('/')
+
+
+@app.post('/discord-bots/edit')
+@auth
+def discord_bot_edit():
+    bot_id = request.form.get('bot_id', '')
+    name = request.form.get('name', '').strip()[:50]
+
+    if not name:
+        abort(400, 'Bot-Name erforderlich')
+
+    token = request.form.get('token', '').strip()
+    channel = request.form.get('channel', '').strip()
+    guild = request.form.get('guild', '').strip()
+    roles = request.form.get('roles', '').strip()[:300]
+
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, bot_id)
+
+        if bot is None:
+            abort(404, 'Discord-Bot nicht gefunden')
+
+        bot['name'] = name
+
+        if token and token != bot.get('token', ''):
+            bot['token'] = token
+            bot['dashboard_message_id'] = ''
+            bot['synced_guild_id'] = ''
+            bot.pop('synced_commands_enabled', None)
+
+        if channel != bot.get('channel_id', ''):
+            bot['channel_id'] = channel
+            bot['dashboard_message_id'] = ''
+
+        bot['guild_id'] = guild
+        bot['admin_role_ids'] = roles
+
+        save(d)
+
+    return redirect('/')
+
+@app.post('/discord-bots/add')
+@auth
+def discord_bot_add():
+    name = request.form.get('name', '').strip()[:50]
+
+    if not name:
+        abort(400, 'Bot-Name erforderlich')
+
+    with LOCK:
+        d = config()
+
+        if len(d.get('discord_bots', [])) >= 10:
+            abort(400, 'Maximal 10 Discord-Bots erlaubt')
+
+        create_discord_bot(d, name)
+        save(d)
+
+    return redirect('/')
+
 @app.post('/discord')
 @auth
 def discord_settings():
-    d=config(); token=request.form.get('token','').strip()
-    if token: d['discord_token']=token
-    for field,key in [('channel','discord_channel_id'),('guild','discord_guild_id'),('roles','admin_role_ids')]: d[key]=request.form.get(field,'').strip()[:300]
-    save(d); return redirect('/')
+    token = request.form.get('token', '').strip()
+    channel = request.form.get('channel', '').strip()[:300]
+    guild = request.form.get('guild', '').strip()[:300]
+    roles = request.form.get('roles', '').strip()[:300]
+
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, 'bot1')
+
+        if bot is None:
+            abort(404, 'Hauptbot nicht gefunden')
+
+        if token and token != bot.get('token', ''):
+            bot['token'] = token
+            bot['dashboard_message_id'] = ''
+            bot['synced_guild_id'] = ''
+            bot.pop('synced_commands_enabled', None)
+
+        if channel != bot.get('channel_id', ''):
+            bot['channel_id'] = channel
+            bot['dashboard_message_id'] = ''
+
+        bot['guild_id'] = guild
+        bot['admin_role_ids'] = roles
+
+        save(d)
+
+    return redirect('/')
 @app.post('/logo')
 @auth
 def logo():
@@ -452,6 +887,49 @@ def logo():
         im=Image.open(io.BytesIO(raw)); im.verify(); im=Image.open(io.BytesIO(raw)).convert('RGBA'); im.thumbnail((128,128)); im.save(ROOT/'logo.png')
     except Exception: abort(400,'Ungültiges Bild')
     d=config();d['logo']=True;save(d);return redirect('/')
+@app.post('/background-upload')
+@auth
+def background_upload():
+    f = request.files.get('background')
+    if not f or not f.filename:
+        abort(400, 'Kein Hintergrundbild ausgewählt')
+
+    raw = f.stream.read(5 * 1024 * 1024 + 1)
+    if len(raw) > 5 * 1024 * 1024:
+        abort(413, 'Bild ist größer als 5 MB')
+
+    try:
+        with Image.open(io.BytesIO(raw)) as source:
+            if source.format not in ('PNG', 'JPEG'):
+                abort(400, 'Nur PNG und JPG erlaubt')
+            source.verify()
+
+        with Image.open(io.BytesIO(raw)) as source:
+            if source.width * source.height > 20000000:
+                abort(400, 'Bildauflösung zu groß')
+            picture = source.convert('RGB')
+            picture.thumbnail((1920, 1080))
+            picture.save(ROOT / 'background.png', format='PNG')
+
+    except (OSError, ValueError, TypeError):
+        abort(400, 'Ungültiges Hintergrundbild')
+
+    d = config()
+    d['background_enabled'] = True
+    save(d)
+    return redirect('/')
+
+
+@app.post('/background-remove')
+@auth
+def background_remove():
+    (ROOT / 'background.png').unlink(missing_ok=True)
+    d = config()
+    d['background_enabled'] = False
+    save(d)
+    return redirect('/')
+
+
 @app.post('/reset-block')
 @auth
 def reset_block():
@@ -527,12 +1005,19 @@ def fit_text(draw,text,max_width,size,family,min_size=12):
             text=text[:-1]
         text+='…'
     return text,font(size,family)
-def draw_discord_graph(draw, miner_ip, x, y, width, height, theme, family):
+def draw_discord_graph(image, draw, miner_ip, x, y, width, height, theme, family, cfg=None):
     """Zeichnet echte Messwerte der letzten 15 Minuten in ein Discord-PNG."""
-    draw.rounded_rectangle(
+    cfg = cfg or {}
+    graph_color = cfg.get('graph_bg', '#17262b')
+    graph_opacity = cfg.get('graph_opacity', 100)
+    graph_grid_color = cfg.get('graph_grid_color', '#34444b')
+
+    draw_transparent_card(
+        image,
         (x, y, x + width, y + height),
-        radius=16,
-        fill=theme['panel']
+        16,
+        graph_color,
+        graph_opacity
     )
     draw.text(
         (x + 20, y + 14),
@@ -562,7 +1047,7 @@ def draw_discord_graph(draw, miner_ip, x, y, width, height, theme, family):
 
     for fraction in (0, 0.25, 0.5, 0.75, 1):
         yy = int(top + (bottom - top) * fraction)
-        draw.line((left, yy, right, yy), fill='#34444b', width=1)
+        draw.line((left, yy, right, yy), fill=graph_grid_color, width=1)
 
     if len(points) < 2:
         draw.text(
@@ -618,6 +1103,73 @@ def draw_discord_graph(draw, miner_ip, x, y, width, height, theme, family):
             font=font(17, family)
         )
 
+def dashboard_background(width, height, cfg):
+    theme = cfg['theme']
+    background = Image.new('RGB', (width, height), theme['bg'])
+
+    if not cfg.get('background_enabled'):
+        return background
+
+    path = ROOT / 'background.png'
+    if not path.is_file():
+        return background
+
+    try:
+        with Image.open(path) as source:
+            fit = cfg.get('background_fit', 'cover')
+            if fit == 'contain':
+                picture = ImageOps.contain(
+                    source.convert('RGB'), (width, height)
+                )
+                x = (width - picture.width) // 2
+                y = (height - picture.height) // 2
+                background.paste(picture, (x, y))
+            else:
+                background = ImageOps.fit(
+                    source.convert('RGB'), (width, height)
+                )
+
+        dim = max(0, min(90, int(cfg.get('background_dim', 0))))
+        if dim:
+            overlay = Image.new('RGB', (width, height), '#000000')
+            background = Image.blend(background, overlay, dim / 100)
+
+    except (OSError, ValueError, TypeError) as error:
+        logging.warning("Hintergrundbild konnte nicht geladen werden: %s", error)
+
+    return background
+
+
+def draw_transparent_card(image, box, radius, color, opacity):
+    opacity = max(0, min(100, int(opacity)))
+
+    if opacity == 100:
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle(box, radius=radius, fill=color)
+        return
+
+    from PIL import ImageColor
+
+    x1, y1, x2, y2 = map(int, box)
+    width = x2 - x1 + 1
+    height = y2 - y1 + 1
+
+    overlay = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+
+    rgb = ImageColor.getrgb(color)
+
+    overlay_draw.rounded_rectangle(
+        (0, 0, width - 1, height - 1),
+        radius=radius,
+        fill=(*rgb, round(opacity * 255 / 100))
+    )
+
+    region = image.crop((x1, y1, x2 + 1, y2 + 1)).convert('RGBA')
+    result = Image.alpha_composite(region, overlay).convert('RGB')
+    image.paste(result, (x1, y1))
+
+
 def image_dashboard(index=None):
     d=config(); miners=scan(); alert=d.get('block_alert')
     if alert: index=next((i for i,m in enumerate(miners) if m['ip']==alert['ip']),0)
@@ -627,13 +1179,22 @@ def image_dashboard(index=None):
     title_size=max(24,min(66,int(d.get('font_title_size',43))))
     value_size=max(20,min(58,int(d.get('font_value_size',38))))
     label_size=max(14,min(32,int(d.get('font_label_size',22))))
-    vals=list((m['values'] if m else {}).items())
-    priority={'hashrate_ghs':0,'best_share_all_time':1,'device_power_w':2}
-    vals.sort(key=lambda item: priority.get(item[0],3))
-    hero_keys={'hashrate_ghs','best_share_all_time'}
-    hero_vals=[item for item in vals if item[0] in hero_keys]
-    detail_vals=[item for item in vals if item[0] not in hero_keys]
-    cols=3
+    fixed_keys={'hashrate_ghs','best_share_all_time','accepted_shares','rejected_shares'}
+    raw=m.get('raw') if m else None
+    raw=raw if isinstance(raw,dict) else {}
+    hero_vals=[
+        ('hashrate_ghs',formatted('hashrate_ghs',raw)),
+        ('best_share_all_time',formatted('best_share_all_time',raw)),
+        ('shares',{
+            'accepted_shares':formatted('accepted_shares',raw),
+            'rejected_shares':formatted('rejected_shares',raw)
+        })
+    ]
+    detail_vals=[
+        (k,v) for k,v in (m['values'] if m else {}).items()
+        if k not in fixed_keys and k != 'firmware_version'
+    ]
+    cols=5
     rows=(len(detail_vals)+cols-1)//cols
     card_h=104
     hero_h=140 if hero_vals else 0
@@ -643,7 +1204,7 @@ def image_dashboard(index=None):
     graph_gap=20
     graph_y=top+hero_space+rows*(card_h+12)+graph_gap
     height=max(690,graph_y+graph_h+30)
-    im=Image.new('RGB',(1000,height),theme['bg']); draw=ImageDraw.Draw(im)
+    im=dashboard_background(1000,height,d); draw=ImageDraw.Draw(im)
     heading,heading_font=fit_text(draw,d['title'],750,title_size,family,20)
     draw.text((36,27),heading,fill=theme['accent'],font=heading_font)
     logo_path=ROOT/'logo.png'
@@ -653,6 +1214,18 @@ def image_dashboard(index=None):
                 logo=original.convert('RGBA');logo.thumbnail((124,124))
                 im.paste(logo,(1000-30-logo.width,20),logo)
         except Exception:pass
+    firmware = str(raw.get('firmware_version') or '').strip()
+    if firmware:
+        fw_text, fw_font = fit_text(
+            draw, 'Firmware ' + firmware, 190, 16, family, 12
+        )
+        fw_width = draw.textlength(fw_text, font=fw_font)
+        draw.text(
+            (970 - fw_width, 151),
+            fw_text,
+            fill='#a1b5b7',
+            font=fw_font
+        )
     y=100
     if alert:
         draw.rounded_rectangle((28,y,972,y+88),radius=13,fill='#45351b',outline='#ffd166',width=3)
@@ -669,37 +1242,63 @@ def image_dashboard(index=None):
         hero_w=(1000-2*margin-(len(hero_vals)-1)*hero_gap)//len(hero_vals)
         for n,(k,v) in enumerate(hero_vals):
             x=margin+n*(hero_w+hero_gap)
-            draw.rounded_rectangle((x,y,x+hero_w,y+hero_h),radius=18,fill=theme['panel'])
-            label,lf=fit_text(draw,FIELDS.get(k,k).upper(),hero_w-36,24,family,15)
-            value,vf=fit_text(draw,v,hero_w-36,58,family,22)
-            draw.text((x+20,y+20),label,fill=theme['text'],font=lf)
-            draw.text((x+20,y+65),value,
-                      fill=(m.get('colors') or {}).get(k,theme['accent']),font=vf)
+            draw_transparent_card(im,(x,y,x+hero_w,y+hero_h),18,theme['panel'],d.get('panel_opacity',100))
+            if k=='shares':
+                label,lf=fit_text(draw,'SHARES',hero_w-36,24,family,15)
+                draw.text((x+20,y+20),label,fill=theme['text'],font=lf)
+                accepted=v.get('accepted_shares','–')
+                rejected=v.get('rejected_shares','–')
+                combined=f'{accepted} / {rejected}'
+                value,vf=fit_text(draw,combined,hero_w-36,48,family,18)
+                ax=x+20
+                sy=y+65
+                draw.text((ax,sy),str(accepted),fill='#86efac',font=vf)
+                ax+=draw.textlength(str(accepted),font=vf)
+                draw.text((ax,sy),' / ',fill=theme['text'],font=vf)
+                ax+=draw.textlength(' / ',font=vf)
+                draw.text((ax,sy),str(rejected),fill='#fb7185',font=vf)
+            else:
+                label,lf=fit_text(draw,FIELDS.get(k,k).upper(),hero_w-36,24,family,15)
+                value,vf=fit_text(draw,v,hero_w-36,58,family,22)
+                draw.text((x+20,y+20),label,fill=theme['text'],font=lf)
+                draw.text((x+20,y+65),value,
+                          fill=(m.get('colors') or {}).get(k,theme['accent']),font=vf)
         y+=hero_space
     card_w=(1000-2*margin-(cols-1)*gap)//cols
     for n,(k,v) in enumerate(detail_vals):
         col=n%cols;row=n//cols;x=margin+col*(card_w+gap);yy=y+row*(card_h+12)
-        draw.rounded_rectangle((x,yy,x+card_w,yy+card_h),radius=14,fill=theme['panel'])
+        draw_transparent_card(im,(x,yy,x+card_w,yy+card_h),14,theme['panel'],d.get('panel_opacity',100))
         label,lf=fit_text(draw,FIELDS.get(k,k),card_w-30,label_size,family,13)
         value,vf=fit_text(draw,v,card_w-30,value_size,family,17)
         draw.text((x+16,yy+13),label,fill=theme['text'],font=lf)
         draw.text((x+16,yy+card_h-15-vf.getbbox(value)[3]),value,fill=(m.get('colors') or {}).get(k,theme['accent']),font=vf)
     if m:
-        draw_discord_graph(draw,m['ip'],margin,graph_y,1000-2*margin,graph_h,theme,family)
+        draw_discord_graph(im,draw,m['ip'],margin,graph_y,1000-2*margin,graph_h,theme,family,d)
     out=io.BytesIO();im.save(out,format='PNG');out.seek(0);return out
 @app.get('/preview.png')
 @auth
 def preview():return send_file(image_dashboard(),mimetype='image/png',max_age=0)
 
 # Setup wizard and settings (dashboard authentication applies to all routes).
-SETUP_PAGE="""<!doctype html><html lang="{{lang}}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bitaxe Live Setup</title><style>body{margin:0;background:radial-gradient(circle at top,#26305a,#0b111b 65%);color:#f0f8ff;font:16px system-ui}main{max-width:740px;margin:45px auto;padding:24px}section{background:#17242adf;border:1px solid #3b5260;border-radius:18px;padding:24px;margin-bottom:20px}h1{color:#49e5c4}label{display:block;margin:15px 0}input,select{display:block;width:100%;box-sizing:border-box;background:#0b1116;color:white;border:1px solid #637780;border-radius:9px;padding:12px;margin-top:6px}button,.btn{display:inline-block;background:#46e0c2;color:#09141a;border:0;border-radius:9px;padding:12px 20px;font-weight:bold;cursor:pointer;text-decoration:none}a{color:#5aeacb}small,p,li{line-height:1.65}.hint{color:#bacbd2}code{color:#f6c979}nav{display:flex;gap:12px;flex-wrap:wrap}</style></head><body><main><h1>⛏️ BITAXE LIVE</h1><p class="hint">{{t.welcome}}</p><nav><a href="/language?lang=de">🇩🇪 Deutsch</a><a href="/language?lang=en">🇬🇧 English</a></nav><section><h2>1 · {{t.language}}</h2><p>{{t.language_help}}</p><form method="post" action="/language"><select name="lang"><option value="de" {% if lang=='de' %}selected{% endif %}>Deutsch</option><option value="en" {% if lang=='en' %}selected{% endif %}>English</option></select><button>{{t.save_language}}</button></form></section><section><h2>2 · {{t.miner}}</h2><form method="post" action="/setup-miner"><label>{{t.miner_name}}<input name="name" value="{{miner.name if miner else 'TERROR'}}" maxlength="50" required></label><label>{{t.miner_ip}}<input name="ip" value="{{miner.ip if miner else ''}}" placeholder="192.168.178.24" required></label><button>{{t.save_miner}}</button></form></section><section><h2>3 · Discord</h2><p><a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">Discord Developer Portal ↗</a></p><ol>{% for instruction in t.instructions %}<li>{{instruction}}</li>{% endfor %}</ol><p class="hint">{{t.permissions}}</p><p class="hint">{{t.invite}}</p><form method="post" action="/setup-discord"><label>{{t.token}}<input name="token" type="password" autocomplete="new-password" placeholder="{{t.token_hint}}"></label><label>{{t.guild}}<input name="guild" value="{{cfg.discord_guild_id}}" inputmode="numeric"></label><label>{{t.channel}}<input name="channel" value="{{cfg.discord_channel_id}}" inputmode="numeric"></label><label>{{t.roles}}<input name="roles" value="{{cfg.admin_role_ids}}"></label><button>{{t.save_bot}}</button></form></section><section><h2>4 · {{t.finish}}</h2><p>{{t.ready}}</p><p>Miner: <b>{{cfg.miners|length}}</b> · Discord: <b>{{'✓' if cfg.discord_token else '✗'}}</b></p><form method="post" action="/finish-setup"><button>{{t.start_bot}}</button></form><p><a href="/">{{t.home}}</a></p></section></main></body></html>"""
+SETUP_PAGE="""<!doctype html><html lang="{{lang}}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bitaxe Live Setup</title><style>body{margin:0;background:radial-gradient(circle at top,#26305a,#0b111b 65%);color:#f0f8ff;font:16px system-ui}main{max-width:740px;margin:45px auto;padding:24px}section{background:#17242adf;border:1px solid #3b5260;border-radius:18px;padding:24px;margin-bottom:20px}h1{color:#49e5c4}label{display:block;margin:15px 0}input,select{display:block;width:100%;box-sizing:border-box;background:#0b1116;color:white;border:1px solid #637780;border-radius:9px;padding:12px;margin-top:6px}button,.btn{display:inline-block;background:#46e0c2;color:#09141a;border:0;border-radius:9px;padding:12px 20px;font-weight:bold;cursor:pointer;text-decoration:none}a{color:#5aeacb}small,p,li{line-height:1.65}.hint{color:#bacbd2}code{color:#f6c979}nav{display:flex;gap:12px;flex-wrap:wrap}</style></head><body><main><h1>⛏️ BITAXE LIVE</h1><p class="hint">{{t.welcome}}</p><nav><a href="/language?lang=de">🇩🇪 Deutsch</a><a href="/language?lang=en">🇬🇧 English</a></nav><section><h2>1 · {{t.language}}</h2><p>{{t.language_help}}</p><form method="post" action="/language"><select name="lang"><option value="de" {% if lang=='de' %}selected{% endif %}>Deutsch</option><option value="en" {% if lang=='en' %}selected{% endif %}>English</option></select><button>{{t.save_language}}</button></form></section><section><h2>2 · {{t.miner}}</h2><form method="post" action="/setup-miner"><label>{{t.miner_name}}<input name="name" value="{{miner.name if miner else 'TERROR'}}" maxlength="50" required></label><label>{{t.miner_ip}}<input name="ip" value="{{miner.ip if miner else ''}}" placeholder="192.168.178.24" required></label><button>{{t.save_miner}}</button></form></section><section><h2>3 · Discord</h2><p><a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">Discord Developer Portal ↗</a></p><ol>{% for instruction in t.instructions %}<li>{{instruction}}</li>{% endfor %}</ol><p class="hint">{{t.permissions}}</p><p class="hint">{{t.invite}}</p><form method="post" action="/setup-discord"><label>{{t.token}}<input name="token" type="password" autocomplete="new-password" placeholder="{{t.token_hint}}"></label><label>{{t.guild}}<input name="guild" value="{{main_bot.get('guild_id', '')}}" inputmode="numeric"></label><label>{{t.channel}}<input name="channel" value="{{main_bot.get('channel_id', '')}}" inputmode="numeric"></label><label>{{t.roles}}<input name="roles" value="{{main_bot.get('admin_role_ids', '')}}"></label><button>{{t.save_bot}}</button></form></section><section><h2>4 · {{t.finish}}</h2><p>{{t.ready}}</p><p>Miner: <b>{{cfg.miners|length}}</b> · Discord: <b>{{'✓' if main_bot.get('token') else '✗'}}</b></p><form method="post" action="/finish-setup"><button>{{t.start_bot}}</button></form><p><a href="/">{{t.home}}</a></p></section></main></body></html>"""
 TRANSLATIONS={
  'de':dict(welcome='Einrichtung in vier Schritten. Einstellungen können später jederzeit geändert werden.',language='Sprache auswählen',language_help='Diese Sprache wird für den Einrichtungsassistenten verwendet.',save_language='Sprache speichern',miner='Miner einrichten',miner_name='Miner-Name',miner_ip='Private LAN-IP des Miners',save_miner='Miner speichern',instructions=['Neue Anwendung anlegen und unter Bot einen Bot erstellen.','Im Bot-Bereich den Token erzeugen und sicher kopieren. Token niemals im Chat veröffentlichen.','Unter OAuth2 → URL Generator die Scopes bot und applications.commands wählen.','Bot-Berechtigungen: View Channels, Send Messages, Embed Links, Attach Files und Read Message History. Administrator-Berechtigung ist für den Bot nicht nötig.','Mit dem erzeugten OAuth2-Link den Bot auf deinen Discord-Server einladen.','Entwicklermodus in Discord einschalten und Server-ID, Kanal-ID sowie optional Admin-Rollen-IDs kopieren.','Die Slash-Commands sind nur für Discord-Administratoren oder eingetragene Admin-Rollen ausführbar. Unter Integrationen können sie für @everyone zusätzlich deaktiviert werden.'],permissions='Der Bot braucht keine Administrator-Rechte. Für die Miner-Steuerung gelten eigene Admin-Prüfungen und private Bestätigungsbuttons.',invite='Der OAuth2-Einladungslink wird im Developer Portal erzeugt. Bitte nur den eigenen Bot einladen.',token='Bot-Token',token_hint='Leer lassen = gespeicherten Token behalten',guild='Server-ID (Guild ID)',channel='Dashboard-Kanal-ID',roles='Admin-Rollen-IDs (kommagetrennt, optional)',save_bot='Bot-Einstellungen speichern',finish='Abschluss',ready='Speichere zuerst Miner und Bot. Danach kann der Bot gestartet werden.',start_bot='Einrichtung abschließen und Bot starten',home='Zum Dashboard'),
  'en':dict(welcome='Set up your dashboard in four steps. You can change these settings later.',language='Choose language',language_help='This language is used for the setup wizard.',save_language='Save language',miner='Configure miner',miner_name='Miner name',miner_ip='Miner private LAN IP',save_miner='Save miner',instructions=['Create a new application, then create a bot in the Bot section.','Generate a token in the Bot section and keep it secret. Never share your token in chat.','Under OAuth2 → URL Generator, select the bot and applications.commands scopes.','Bot permissions: View Channels, Send Messages, Embed Links, Attach Files and Read Message History. The bot does not need Administrator permission.','Invite your bot to your Discord server using the generated OAuth2 URL.','Enable Discord Developer Mode and copy your server ID, channel ID and optional admin role IDs.','Slash commands are limited to Discord administrators or configured admin roles. You can also disable commands for @everyone in Integrations.'],permissions='The bot does not need Administrator permission. Miner control uses separate admin checks and private confirmation buttons.',invite='Generate the OAuth2 invitation URL in the Developer Portal. Only invite your own bot.',token='Bot token',token_hint='Leave blank to keep saved token',guild='Server ID (Guild ID)',channel='Dashboard channel ID',roles='Admin role IDs (comma-separated, optional)',save_bot='Save bot settings',finish='Finish',ready='Save a miner and bot settings first, then start the bot.',start_bot='Finish setup and start bot',home='Go to dashboard')}
 @app.get('/setup')
 @auth
 def setup():
-    d=config();lang=d.get('language','de');return render_template_string(SETUP_PAGE,lang=lang,t=TRANSLATIONS.get(lang,TRANSLATIONS['de']),cfg=d,miner=d['miners'][0] if d['miners'] else None)
+    d = config()
+    lang = d.get('language', 'de')
+    main_bot = find_discord_bot(d, 'bot1') or {}
+
+    return render_template_string(
+        SETUP_PAGE,
+        lang=lang,
+        t=TRANSLATIONS.get(lang, TRANSLATIONS['de']),
+        cfg=d,
+        miner=d['miners'][0] if d['miners'] else None,
+        main_bot=main_bot
+    )
 @app.route('/language',methods=['GET','POST'])
 @auth
 def language():
@@ -718,36 +1317,116 @@ def setup_miner():
 @app.post('/setup-discord')
 @auth
 def setup_discord():
-    d=config();token=request.form.get('token','').strip()
-    if token:d['discord_token']=token
-    for field,key in [('guild','discord_guild_id'),('channel','discord_channel_id'),('roles','admin_role_ids')]:d[key]=request.form.get(field,'').strip()[:300]
-    save(d);return redirect('/setup')
+    token = request.form.get('token', '').strip()
+    guild = request.form.get('guild', '').strip()[:300]
+    channel = request.form.get('channel', '').strip()[:300]
+    roles = request.form.get('roles', '').strip()[:300]
+
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, 'bot1')
+
+        if bot is None:
+            bot = create_discord_bot(d, 'Hauptbot')
+            bot['id'] = 'bot1'
+
+        if token and token != bot.get('token', ''):
+            bot['token'] = token
+            bot['dashboard_message_id'] = ''
+            bot['synced_guild_id'] = ''
+            bot.pop('synced_commands_enabled', None)
+
+        if channel != bot.get('channel_id', ''):
+            bot['channel_id'] = channel
+            bot['dashboard_message_id'] = ''
+
+        bot['guild_id'] = guild
+        bot['admin_role_ids'] = roles
+
+        d['discord_bots_migrated'] = True
+        save(d)
+
+    return redirect('/setup')
+
 @app.post('/finish-setup')
 @auth
 def finish_setup():
-    d=config()
-    if not d['miners']:abort(400,'At least one miner required')
-    d['setup_complete']=True;d['bot_enabled']=False;save(d);return redirect('/')
+    with LOCK:
+        d = config()
+
+        if not d['miners']:
+            abort(400, 'At least one miner required')
+
+        d['setup_complete'] = True
+
+        bot = find_discord_bot(d, 'bot1')
+
+        if bot is not None and bot.get('token'):
+            bot['enabled'] = True
+
+        save(d)
+
+    return redirect('/')
 @app.post('/bot-toggle')
 @auth
 def bot_toggle():
-    d=config();d['bot_enabled']=not d.get('bot_enabled',False);save(d);return redirect('/')
+    with LOCK:
+        d = config()
+        bot = find_discord_bot(d, 'bot1')
+
+        if bot is None:
+            abort(404, 'Hauptbot nicht gefunden')
+
+        if not bot.get('enabled', False) and not bot.get('token'):
+            abort(400, 'Bitte zuerst einen Bot-Token hinterlegen')
+
+        bot['enabled'] = not bot.get('enabled', False)
+        save(d)
+
+    return redirect('/')
 @app.get('/settings')
 @auth
 def settings():return redirect('/setup')
 
 # Discord bot is optional and runs in its own background thread.
-def discord_worker():
+def discord_bot_worker(bot_id):
     import asyncio, discord
     from discord import app_commands
+
     while True:
-        d=config(); token=d.get('discord_token','')
-        if not token or not d.get('bot_enabled'):time.sleep(5);continue
+        bot = current_discord_bot(bot_id)
+
+        if bot is None:
+            return
+
+        token = bot.get('token', '')
+
+        if not token or not bot.get('enabled', False):
+            return
         intents=discord.Intents.default(); client=discord.Client(intents=intents); tree=app_commands.CommandTree(client)
         def allowed(inter):
-            if inter.user.guild_permissions.administrator:return True
-            ids={x.strip() for x in config().get('admin_role_ids','').split(',') if x.strip()}
-            return any(str(r.id) in ids for r in getattr(inter.user,'roles',[]))
+            current = current_discord_bot(bot_id)
+
+            if current is None or not current.get('enabled', False):
+                return False
+
+            if not current.get('commands_enabled', True):
+                return False
+
+            permissions = getattr(inter.user, 'guild_permissions', None)
+            if permissions and permissions.administrator:
+                return True
+
+            ids = {
+                x.strip()
+                for x in current.get('admin_role_ids', '').split(',')
+                if x.strip()
+            }
+
+            return any(
+                str(role.id) in ids
+                for role in getattr(inter.user, 'roles', [])
+            )
         async def deny(inter):await inter.response.send_message('Nur für autorisierte Admins.',ephemeral=True)
         async def show(inter,idx=None):
             if not allowed(inter):return await deny(inter)
@@ -825,43 +1504,311 @@ def discord_worker():
                     await inter.response.send_message(f"⚠️ {operation.upper()} · {target['name']} ({target['ip']})?",view=v,ephemeral=True)
                 return control
             tree.command(name=cmd,description='Miner control / Miner steuern (confirmation required)')(make_control(cmd))
-        @client.event
-        async def on_ready():
+        command_sync_lock = asyncio.Lock()
+
+        async def sync_bot_commands():
+            async with command_sync_lock:
+                return await sync_bot_commands_locked()
+
+        async def sync_bot_commands_locked():
+            current = current_discord_bot(bot_id)
+
+            if current is None:
+                return False
+
+            enabled = bool(current.get('commands_enabled', True))
+            guild_id = str(current.get('guild_id', '')).strip()
+            last_synced_guild = str(
+                current.get('synced_guild_id', '')
+            ).strip()
+
             try:
-                gid=config().get('discord_guild_id','')
-                if gid:
-                    guild=discord.Object(id=int(gid));tree.copy_global_to(guild=guild);await tree.sync(guild=guild)
-                else:await tree.sync()
-                logging.info('Discord commands synchronized')
-            except Exception:logging.exception('Discord sync error')
+                guild = (
+                    discord.Object(id=int(guild_id))
+                    if guild_id else None
+                )
+
+                if last_synced_guild and last_synced_guild != guild_id:
+                    old_guild = discord.Object(
+                        id=int(last_synced_guild)
+                    )
+                    tree.clear_commands(guild=old_guild)
+                    await tree.sync(guild=old_guild)
+
+                if guild is not None:
+                    if enabled:
+                        tree.copy_global_to(guild=guild)
+                    else:
+                        tree.clear_commands(guild=guild)
+
+                    await tree.sync(guild=guild)
+
+                    # Globale Befehle entfernen, damit sie nicht
+                    # zusätzlich auf anderen Servern erscheinen.
+                    saved_commands = tree.get_commands()
+                    tree.clear_commands(guild=None)
+
+                    try:
+                        await tree.sync()
+                    finally:
+                        for command in saved_commands:
+                            tree.add_command(command)
+
+                else:
+                    saved_commands = tree.get_commands()
+
+                    if not enabled:
+                        tree.clear_commands(guild=None)
+
+                    try:
+                        await tree.sync()
+                    finally:
+                        if not enabled:
+                            for command in saved_commands:
+                                tree.add_command(command)
+
+                if not save_discord_sync_state(bot_id, token, guild_id, enabled):
+                    logging.warning(
+                        'Discord sync state could not be saved for %s',
+                        bot_id
+                    )
+                    return False
+
+                logging.info(
+                    'Discord commands synced: bot=%s enabled=%s guild=%s',
+                    bot_id,
+                    enabled,
+                    guild_id or 'global'
+                )
+
+                return True
+
+            except Exception:
+                logging.exception(
+                    'Discord command sync failed for %s',
+                    bot_id
+                )
+                return False
+
         async def periodic():
             await client.wait_until_ready()
+
+            cached_message = None
+            cached_channel_id = None
+
             while not client.is_closed():
                 try:
-                    cfg=config()
-                    if not cfg.get('bot_enabled') or cfg.get('discord_token')!=token:
-                        await client.close();break
-                    cid=cfg.get('discord_channel_id')
+                    cfg = config()
+                    bot = current_discord_bot(bot_id)
+
+                    if (
+                        bot is None
+                        or not bot.get('enabled', False)
+                        or bot.get('token', '') != token
+                    ):
+                        await client.close()
+                        break
+
+                    cid = str(bot.get('channel_id', '')).strip()
+                    mid = str(bot.get('dashboard_message_id', '')).strip()
+
                     if cid:
-                        channel=client.get_channel(int(cid)) or await client.fetch_channel(int(cid))
-                        mid=cfg.get('dashboard_message_id','')
-                        file=discord.File(image_dashboard(),'dashboard.png')
+                        channel = (
+                            client.get_channel(int(cid))
+                            or await client.fetch_channel(int(cid))
+                        )
+
+                        if (
+                            cached_channel_id != cid
+                            or (
+                                cached_message is not None
+                                and str(cached_message.id) != mid
+                            )
+                        ):
+                            cached_message = None
+                            cached_channel_id = cid
+
                         if mid:
                             try:
-                                message=await channel.fetch_message(int(mid));await message.edit(content=cfg['title'],attachments=[file])
-                            except discord.NotFound:mid=''
+                                if cached_message is None:
+                                    cached_message = await channel.fetch_message(
+                                        int(mid)
+                                    )
+
+                                upload_start = time.monotonic()
+
+                                await cached_message.edit(
+                                    content=cfg['title'],
+                                    attachments=[
+                                        discord.File(
+                                            image_dashboard(),
+                                            'dashboard.png'
+                                        )
+                                    ]
+                                )
+
+                                logging.info(
+                                    'Discord dashboard %s updated in %.2fs',
+                                    bot_id,
+                                    time.monotonic() - upload_start
+                                )
+
+                            except discord.NotFound:
+                                mid = ''
+                                cached_message = None
+
                         if not mid:
-                            message=await channel.send(content=cfg['title'],file=file)
-                            with LOCK:
-                                latest=config();latest['dashboard_message_id']=str(message.id);save(latest)
-                except Exception:logging.exception('Discord dashboard update failed')
-                await asyncio.sleep(config().get('refresh_seconds',10))
+                            cached_message = await channel.send(
+                                content=cfg['title'],
+                                file=discord.File(
+                                    image_dashboard(),
+                                    'dashboard.png'
+                                )
+                            )
+
+                            save_discord_message_id(
+                                bot_id,
+                                token,
+                                cid,
+                                str(cached_message.id)
+                            )
+
+                except Exception:
+                    logging.exception(
+                        'Discord dashboard update failed for %s',
+                        bot_id
+                    )
+
+                await asyncio.sleep(
+                    max(5, config().get('refresh_seconds', 10))
+                )
+
+        async def command_watch():
+            await client.wait_until_ready()
+
+            previous = None
+
+            while not client.is_closed():
+                current = current_discord_bot(bot_id)
+
+                if (
+                    current is None
+                    or not current.get('enabled', False)
+                    or current.get('token', '') != token
+                ):
+                    logging.info(
+                        'Discord bot %s stopping after configuration change',
+                        bot_id
+                    )
+                    await client.close()
+                    return
+
+                enabled = bool(
+                    current.get('commands_enabled', True)
+                )
+                guild_id = str(
+                    current.get('guild_id', '')
+                ).strip()
+
+                state = (enabled, guild_id)
+
+                if state != previous:
+                    success = await sync_bot_commands()
+
+                    if success:
+                        previous = state
+                    else:
+                        logging.warning(
+                            'Discord command sync retry scheduled: %s',
+                            bot_id
+                        )
+
+                await asyncio.sleep(5)
+
         @client.event
-        async def setup_hook():client.loop.create_task(periodic())
-        try:client.run(token,log_handler=None)
-        except Exception:logging.exception('Discord bot failed; retrying in 30s')
+        async def setup_hook():
+            client.loop.create_task(periodic())
+            client.loop.create_task(command_watch())
+        try:
+            client.run(token, log_handler=None)
+        except Exception:
+            logging.exception(
+                'Discord bot %s disconnected or failed',
+                bot_id
+            )
+
+        current = current_discord_bot(bot_id)
+
+        if current is None:
+            return
+
+        if (
+            not current.get('enabled', False)
+            or current.get('token', '') != token
+        ):
+            continue
+
         time.sleep(30)
 
+def discord_manager():
+    workers = {}
+
+    while True:
+        try:
+            cfg = config()
+
+            for bot in cfg.get('discord_bots', []):
+                bot_id = bot.get('id')
+
+                if not bot_id:
+                    continue
+
+                if not bot.get('enabled', False):
+                    continue
+
+                if not bot.get('token', ''):
+                    continue
+
+                thread = workers.get(bot_id)
+
+                if thread is None or not thread.is_alive():
+                    thread = threading.Thread(
+                        target=discord_bot_worker,
+                        args=(bot_id,),
+                        daemon=True,
+                        name='discord-' + str(bot_id)
+                    )
+
+                    workers[bot_id] = thread
+                    thread.start()
+
+                    logging.info(
+                        'Discord worker started for bot %s',
+                        bot_id
+                    )
+
+            workers = {
+                bot_id: thread
+                for bot_id, thread in workers.items()
+                if thread.is_alive()
+            }
+
+        except Exception:
+            logging.exception('Discord manager failed')
+
+        time.sleep(5)
+
+
+def history_worker():
+    # Sammelt Messwerte unabhängig vom Browser alle 10 Sekunden.
+    while True:
+        try:
+            record_history(scan())
+        except Exception:
+            logging.exception('Background history collection failed')
+        time.sleep(2)
+
 if __name__=='__main__':
-    threading.Thread(target=discord_worker,daemon=True).start()
+    threading.Thread(target=history_worker,daemon=True).start()
+    threading.Thread(target=discord_manager,daemon=True).start()
     app.run(host='0.0.0.0',port=8085,threaded=True)

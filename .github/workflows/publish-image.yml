@@ -35,4 +35,4 @@ jobs:
         with:
           context: ./bitaxe-live
           push: true
-          tags: ghcr.io/maxterror/bitaxe-live:1.0.0
+          tags: ghcr.io/maxterror/bitaxe-live:1.1.0

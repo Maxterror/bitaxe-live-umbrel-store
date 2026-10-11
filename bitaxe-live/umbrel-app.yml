@@ -2,7 +2,7 @@ manifestVersion: 1
 id: bitaxe-live
 category: bitcoin
 name: Bitaxe Live
-version: "1.0.0"
+version: "1.1.0"
 tagline: Live-Monitoring für Bitaxe und HarloOS
 description: >-
   Bitaxe Live bietet ein Dashboard für Bitaxe-Miner mit
