@@ -527,6 +527,97 @@ def fit_text(draw,text,max_width,size,family,min_size=12):
             text=text[:-1]
         text+='…'
     return text,font(size,family)
+def draw_discord_graph(draw, miner_ip, x, y, width, height, theme, family):
+    """Zeichnet echte Messwerte der letzten 15 Minuten in ein Discord-PNG."""
+    draw.rounded_rectangle(
+        (x, y, x + width, y + height),
+        radius=16,
+        fill=theme['panel']
+    )
+    draw.text(
+        (x + 20, y + 14),
+        'LIVE GRAPH · 15 MIN',
+        fill=theme['text'],
+        font=font(23, family)
+    )
+
+    cutoff = time.time() - 900
+    with HISTORY_LOCK:
+        try:
+            history = json.loads(HISTORY_FILE.read_text())
+            points = history.get(miner_ip, []) if isinstance(history, dict) else []
+        except (OSError, ValueError):
+            points = []
+
+    points = [
+        point for point in points
+        if isinstance(point, dict)
+        and isinstance(point.get('time'), (int, float))
+        and cutoff <= point['time'] <= time.time() + 30
+        and isinstance(point.get('values'), dict)
+    ]
+
+    left, right = x + 54, x + width - 22
+    top, bottom = y + 65, y + height - 47
+
+    for fraction in (0, 0.25, 0.5, 0.75, 1):
+        yy = int(top + (bottom - top) * fraction)
+        draw.line((left, yy, right, yy), fill='#34444b', width=1)
+
+    if len(points) < 2:
+        draw.text(
+            (left + 20, top + 35),
+            'Noch nicht genug Messwerte',
+            fill=theme['text'],
+            font=font(22, family)
+        )
+        return
+
+    series = (
+        ('hashrate_ghs', '#86efac', 'Hashrate'),
+        ('device_power_w', '#e7b66e', 'Watt'),
+        ('asic_temp_c', '#facc15', 'ASIC'),
+        ('vr_temp_c', '#fb7185', 'VR'),
+    )
+
+    for index, (key, color, label) in enumerate(series):
+        values = [
+            graph_number(point['values'].get(key))
+            for point in points
+        ]
+        valid = [value for value in values if value is not None]
+        if len(valid) < 2:
+            continue
+
+        low, high = min(valid), max(valid)
+        padding = max((high - low) * 0.15, abs(high) * 0.02, 0.1)
+        low -= padding
+        high += padding
+
+        previous = None
+        for point, value in zip(points, values):
+            if value is None:
+                previous = None
+                continue
+            px = int(left + (right - left) * (point['time'] - cutoff) / 900)
+            px = max(left, min(right, px))
+            py = int(bottom - (value - low) / (high - low) * (bottom - top))
+            if previous is not None:
+                draw.line((previous[0], previous[1], px, py), fill=color, width=3)
+            previous = (px, py)
+
+        legend_x = left + index * 205
+        draw.line(
+            (legend_x, y + height - 23, legend_x + 24, y + height - 23),
+            fill=color, width=4
+        )
+        draw.text(
+            (legend_x + 32, y + height - 36),
+            label,
+            fill=theme['text'],
+            font=font(17, family)
+        )
+
 def image_dashboard(index=None):
     d=config(); miners=scan(); alert=d.get('block_alert')
     if alert: index=next((i for i,m in enumerate(miners) if m['ip']==alert['ip']),0)
@@ -537,18 +628,21 @@ def image_dashboard(index=None):
     value_size=max(20,min(58,int(d.get('font_value_size',38))))
     label_size=max(14,min(32,int(d.get('font_label_size',22))))
     vals=list((m['values'] if m else {}).items())
-    priority={'hashrate_ghs':0,'device_power_w':1}
-    vals.sort(key=lambda item: priority.get(item[0],2))
-    hero_keys={'hashrate_ghs','device_power_w'}
+    priority={'hashrate_ghs':0,'best_share_all_time':1,'device_power_w':2}
+    vals.sort(key=lambda item: priority.get(item[0],3))
+    hero_keys={'hashrate_ghs','best_share_all_time'}
     hero_vals=[item for item in vals if item[0] in hero_keys]
     detail_vals=[item for item in vals if item[0] not in hero_keys]
-    cols=2 if len(vals)<=10 else 3
+    cols=3
     rows=(len(detail_vals)+cols-1)//cols
-    card_h=132 if cols==2 else 124
-    hero_h=170 if hero_vals else 0
+    card_h=104
+    hero_h=140 if hero_vals else 0
     hero_space=hero_h+20 if hero_vals else 0
     top=184+(108 if alert else 0)
-    height=max(690,top+hero_space+rows*(card_h+12)+30)
+    graph_h=280
+    graph_gap=20
+    graph_y=top+hero_space+rows*(card_h+12)+graph_gap
+    height=max(690,graph_y+graph_h+30)
     im=Image.new('RGB',(1000,height),theme['bg']); draw=ImageDraw.Draw(im)
     heading,heading_font=fit_text(draw,d['title'],750,title_size,family,20)
     draw.text((36,27),heading,fill=theme['accent'],font=heading_font)
@@ -579,7 +673,7 @@ def image_dashboard(index=None):
             label,lf=fit_text(draw,FIELDS.get(k,k).upper(),hero_w-36,24,family,15)
             value,vf=fit_text(draw,v,hero_w-36,58,family,22)
             draw.text((x+20,y+20),label,fill=theme['text'],font=lf)
-            draw.text((x+20,y+85),value,
+            draw.text((x+20,y+65),value,
                       fill=(m.get('colors') or {}).get(k,theme['accent']),font=vf)
         y+=hero_space
     card_w=(1000-2*margin-(cols-1)*gap)//cols
@@ -590,6 +684,8 @@ def image_dashboard(index=None):
         value,vf=fit_text(draw,v,card_w-30,value_size,family,17)
         draw.text((x+16,yy+13),label,fill=theme['text'],font=lf)
         draw.text((x+16,yy+card_h-15-vf.getbbox(value)[3]),value,fill=(m.get('colors') or {}).get(k,theme['accent']),font=vf)
+    if m:
+        draw_discord_graph(draw,m['ip'],margin,graph_y,1000-2*margin,graph_h,theme,family)
     out=io.BytesIO();im.save(out,format='PNG');out.seek(0);return out
 @app.get('/preview.png')
 @auth
