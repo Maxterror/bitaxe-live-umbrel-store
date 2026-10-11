@@ -3,11 +3,35 @@ id: bitaxe-live
 category: bitcoin
 name: Bitaxe Live
 version: "1.1.0"
-tagline: Live-Monitoring für Bitaxe und HarloOS
-description: >-
-  Bitaxe Live bietet ein Dashboard für Bitaxe-Miner mit
-  Live-Telemetrie, individuellen Designs, Discord-Integration
-  und Miner-Steuerung.
+tagline: "Live monitoring for Bitaxe and HarloOS miners"
+description: |
+  Bitaxe Live is a self-hosted monitoring dashboard for Bitaxe miners and compatible HarloOS devices.
+
+  LIVE MINING DASHBOARD
+  Monitor hashrate, ASIC and VR temperatures, fan speed, uptime, best share difficulty, share statistics, pool latency, and available device metrics.
+
+  HISTORICAL GRAPHS
+  Visualize mining performance over time with graphs for hashrate, power consumption, and temperatures.
+
+  MINER MONITORING AND CONTROL
+  Monitor configured miners and use supported controls to start, pause, or restart mining.
+
+  DASHBOARD CUSTOMIZATION
+  Customize dashboard titles, logos, backgrounds, transparency, graph colors, fonts, text sizes, and temperature thresholds.
+
+  DISCORD INTEGRATION
+  Publish mining statistics and dashboard images to Discord channels. Use supported slash commands to access mining information and control compatible miners.
+
+  MULTI-BOT MANAGEMENT
+  Configure and manage up to 10 Discord bots independently. Each bot can have its own name, token, Discord server, channel, administrator roles, activation state, and slash-command settings.
+
+  Supported commands include /dashboard, /miners, /miner1 through /miner20, /start, /pause, and /restart, subject to configuration and permissions.
+
+  MINING ALERTS
+  Monitor configured temperature thresholds and changes in the blocks-mined counter.
+
+  UMBREL INTEGRATION
+  Run Bitaxe Live on your own Umbrel server. Settings and stored data are kept separately from the application container to support persistence across normal restarts and compatible updates.
 developer: Bitaxe Live
 website: https://github.com/Maxterror/bitaxe-live-umbrel-store
 dependencies: []
